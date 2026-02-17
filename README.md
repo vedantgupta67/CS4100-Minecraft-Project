@@ -3,6 +3,10 @@
 
 # Installation requirements for MineRL
 
+
+need to clone minerl into minerl folder
+git clone https://github.com/minerllabs/minerl.git minerl
+
 python 3.10:
 run:
 brew install python@3.10
