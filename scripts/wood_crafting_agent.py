@@ -296,8 +296,8 @@ def make_env():
     env.seed(175901257196164)
     print("[make_env] gym.make() done — wrapping env …")
     env = AutoCraftWrapper(env)
-    env = DiscreteActionWrapper(env)
     env = PitchClampWrapper(env)
+    env = DiscreteActionWrapper(env)
     env = ActionRepeatWrapper(env, repeat=4)
     env = ObservationWrapper(env)
     return env
