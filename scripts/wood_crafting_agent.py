@@ -112,6 +112,46 @@ class DiscreteActionWrapper(gym.ActionWrapper):
 
 
 
+class PitchClampWrapper(gym.Wrapper):
+    """
+    Tracks the agent's estimated pitch and clamps it to [PITCH_MIN, PITCH_MAX].
+
+    When the agent would exceed a limit, the pitch delta is zeroed out so the
+    action becomes a no-op in that axis.  This prevents the agent from spinning
+    to look straight up or down and getting stuck there.
+
+    Minecraft's default pitch range: -90 (straight up) to +90 (straight down).
+    We restrict to [-60, 60] so the agent always sees the horizon.
+    """
+
+    PITCH_MIN = -60.0
+    PITCH_MAX =  60.0
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._pitch = 0.0   # estimated current pitch in degrees
+
+    def reset(self):
+        self._pitch = 0.0
+        return self.env.reset()
+
+    def step(self, action):
+        delta = float(action.get("camera", [0.0, 0.0])[0])
+        new_pitch = self._pitch + delta
+        if new_pitch < self.PITCH_MIN:
+            action = dict(action)
+            action["camera"] = np.array(
+                [self.PITCH_MIN - self._pitch, action["camera"][1]], dtype=np.float32)
+            new_pitch = self.PITCH_MIN
+        elif new_pitch > self.PITCH_MAX:
+            action = dict(action)
+            action["camera"] = np.array(
+                [self.PITCH_MAX - self._pitch, action["camera"][1]], dtype=np.float32)
+            new_pitch = self.PITCH_MAX
+        self._pitch = new_pitch
+        return self.env.step(action)
+
+
 class AutoCraftWrapper(gym.Wrapper):
     """
     Wraps MineRLObtainDiamondShovel-v0 to focus on the wood → crafting_table
@@ -224,6 +264,32 @@ class ObservationWrapper(gym.ObservationWrapper):
         return {"pov": pov, "inventory": inv}
 
 
+class ActionRepeatWrapper(gym.Wrapper):
+    """
+    Repeat each chosen action for `repeat` environment steps.
+
+    Rewards are summed across repeated steps; the last observation is returned.
+    Episode terminates early if `done` is True during a repeat.
+
+    A repeat of 8 means one network decision = 8 game ticks, so a single
+    "attack" choice sustains the swing long enough to noticeably damage a log
+    and the agent gets a reward signal much sooner.
+    """
+
+    def __init__(self, env, repeat: int = 8):
+        super().__init__(env)
+        self._repeat = repeat
+
+    def step(self, action):
+        total_reward = 0.0
+        for _ in range(self._repeat):
+            obs, reward, done, info = self.env.step(action)
+            total_reward += reward
+            if done:
+                break
+        return obs, total_reward, done, info
+
+
 def make_env():
     print("[make_env] Launching Minecraft Java process (can take 2–5 min on first run) …")
     env = gym.make("MineRLObtainDiamondShovel-v0")
@@ -231,6 +297,8 @@ def make_env():
     print("[make_env] gym.make() done — wrapping env …")
     env = AutoCraftWrapper(env)
     env = DiscreteActionWrapper(env)
+    env = PitchClampWrapper(env)
+    env = ActionRepeatWrapper(env, repeat=4)
     env = ObservationWrapper(env)
     return env
 
