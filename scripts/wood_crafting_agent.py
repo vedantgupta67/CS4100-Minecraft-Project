@@ -227,6 +227,7 @@ class ObservationWrapper(gym.ObservationWrapper):
 def make_env():
     print("[make_env] Launching Minecraft Java process (can take 2–5 min on first run) …")
     env = gym.make("MineRLObtainDiamondShovel-v0")
+    env.seed(175901257196164)
     print("[make_env] gym.make() done — wrapping env …")
     env = AutoCraftWrapper(env)
     env = DiscreteActionWrapper(env)
