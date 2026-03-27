@@ -39,4 +39,8 @@ pip install -e minerl/
 
 confirm installation with: pip list
 
+
+## Windows Specific
+Install WSL Ubuntu version >22 and Java 8 onto it
+
 Should be able to run code after that!

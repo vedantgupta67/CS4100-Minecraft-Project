@@ -26,6 +26,7 @@ Usage
 
 import argparse
 import os
+import threading
 import time
 import warnings
 from collections import deque
@@ -164,25 +165,70 @@ class AutoCraftWrapper(gym.Wrapper):
     (1 log → 4 planks → 1 crafting_table).
 
     Rewards:
-      +1.0  per new log collected
-      +0.5  per new log (planks bonus)
-      +10.0 when virtual crafting_table is first obtained  (episode ends)
+      +1.0   per new log collected
+      +0.5   per new log (planks bonus)
+      +10.0  when virtual crafting_table is first obtained  (episode ends)
+      -5.0   when the agent dies (episode continues after respawn)
+      +0.03  each step the agent holds attack (sustained swing reward)
+      +0.05  each step the center of view shows wood-colored pixels
+      +0.08  when the tree fills a larger fraction of the view than last step
+             (approach reward, gated on a minimum increase threshold)
     """
 
-    PLANKS_REWARD = 0.5
-    TABLE_REWARD  = 10.0
+    PLANKS_REWARD   = 0.5
+    TABLE_REWARD    = 10.0
+    DEATH_REWARD    = -5.0
+    ATTACK_REWARD   = 0.0    # disabled — rewarded attacking dirt/ground (exploit)
+    LOOK_REWARD     = 0.05   # per step center-of-view shows wood
+    APPROACH_REWARD = 0.08   # when tree grows larger in view (agent moving closer)
+    APPROACH_THRESH = 0.02   # minimum fraction increase to count as approach
+    DOWNWARD_LOOK_PENALTY = -0.04  # per step when pitch > 45° (looking at ground)
+
+    MAX_CONSECUTIVE_RESETS = 5
 
     def __init__(self, env):
         super().__init__(env)
-        self._prev_logs      = 0
-        self._total_logs     = 0
-        self._virtual_planks = 0
-        self._virtual_table  = False
+        self._prev_logs           = 0
+        self._total_logs          = 0
+        self._virtual_planks      = 0
+        self._virtual_table       = False
+        self._was_alive           = True
+        self._prev_tree_frac      = 0.0
+        self._consecutive_resets  = 0
+        self._pitch               = 0.0   # estimated pitch in degrees (+= down)
 
     @staticmethod
     def _count_logs(obs) -> int:
         inv = obs.get("inventory", {})
         return sum(int(inv.get(t, 0)) for t in LOG_TYPES)
+
+    @staticmethod
+    def _tree_pixel_fraction(pov) -> float:
+        """Fraction of pixels that look like wood or leaves (HWC uint8)."""
+        r = pov[:, :, 0].astype(np.float32)
+        g = pov[:, :, 1].astype(np.float32)
+        b = pov[:, :, 2].astype(np.float32)
+        # Wood: warm brown — red-dominant, clearly not grey.
+        # Stricter than dirt: logs have higher R-G and R-B contrast.
+        # Dirt ~(134,96,67): r-g≈38, r-b≈67 → excluded by r-g>45 and r<120 guard.
+        is_wood = (r > g + 45) & (g > b + 5) & (r - b > 55) & (r > 80) & (r < 190)
+        # Leaves: green-dominant
+        is_leaf = (g > r + 5) & (g > b + 5) & (g > 55) & (r < 160) & (b < 140)
+        return float(np.mean(is_wood | is_leaf))
+
+    @staticmethod
+    def _looking_at_wood(pov) -> bool:
+        """True when the central 15 % of the view is mostly wood-coloured."""
+        h, w = pov.shape[:2]
+        mh, mw = max(1, h // 7), max(1, w // 7)
+        cy, cx = h // 2, w // 2
+        center = pov[cy - mh: cy + mh, cx - mw: cx + mw]
+        r = center[:, :, 0].astype(np.float32)
+        g = center[:, :, 1].astype(np.float32)
+        b = center[:, :, 2].astype(np.float32)
+        # Same stricter threshold as _tree_pixel_fraction to exclude dirt
+        is_wood = (r > g + 45) & (g > b + 5) & (r - b > 55) & (r > 80) & (r < 190)
+        return float(np.mean(is_wood)) > 0.25
 
     def _attach(self, obs):
         obs["_logs"]           = self._total_logs
@@ -192,32 +238,101 @@ class AutoCraftWrapper(gym.Wrapper):
 
     def reset(self):
         obs = self.env.reset()
-        self._prev_logs      = self._count_logs(obs)
-        self._total_logs     = 0
-        self._virtual_planks = 0
-        self._virtual_table  = False
+        self._prev_logs          = self._count_logs(obs)
+        self._total_logs         = 0
+        self._virtual_planks     = 0
+        self._virtual_table      = False
+        self._was_alive          = True
+        self._prev_tree_frac     = 0.0
+        self._consecutive_resets = 0
+        self._pitch              = 0.0
         return self._attach(obs)
 
     def step(self, action):
         obs, _env_reward, done, info = self.env.step(action)
+
+        # Detect death: is_alive transitions True → False
+        is_alive = bool(obs.get("life_stats", {}).get("is_alive", True))
+        died = self._was_alive and not is_alive
+        self._was_alive = is_alive
 
         # Count newly collected logs from inventory delta
         curr_logs = self._count_logs(obs)
         new_logs  = max(0, curr_logs - self._prev_logs)
         self._prev_logs = curr_logs
 
-        # Build our own reward signal from scratch
-        reward = float(new_logs)                          # +1 per log
+        # ── Primary log / table rewards ────────────────────────────────────
+        reward = float(new_logs)                                     # +1 per log
         if new_logs > 0:
             self._total_logs     += new_logs
             self._virtual_planks += new_logs * 4
             reward               += self.PLANKS_REWARD * new_logs   # +0.5 per log
 
-        # First time planks ≥ 4 → crafting table obtained → episode ends
+        if died:
+            reward += self.DEATH_REWARD
+
         if not self._virtual_table and self._virtual_planks >= 4:
             self._virtual_table = True
             reward += self.TABLE_REWARD
             done    = True
+
+        # ── Shaping: sustained attack ──────────────────────────────────────
+        if action.get("attack", 0):
+            reward += self.ATTACK_REWARD
+
+        # ── Shaping: penalise looking at ground ────────────────────────────
+        self._pitch += float(action.get("camera", [0.0, 0.0])[0])
+        if self._pitch > 45.0:
+            reward += self.DOWNWARD_LOOK_PENALTY
+
+        # ── Shaping: visual tree signals ───────────────────────────────────
+        pov = obs.get("pov")
+        if pov is not None and pov.ndim == 3 and pov.shape[2] >= 3:
+            # Looking at wood (cross-hair on trunk)
+            if self._looking_at_wood(pov):
+                reward += self.LOOK_REWARD
+
+            # Approach reward: tree takes up more of view → agent moved closer
+            tree_frac = self._tree_pixel_fraction(pov)
+            if tree_frac > self._prev_tree_frac + self.APPROACH_THRESH:
+                reward += self.APPROACH_REWARD
+            self._prev_tree_frac = tree_frac
+
+        # If the underlying env ended the episode (death screen, time-limit, etc.)
+        # but the task isn't complete, respawn internally so the training loop
+        # never sees this as an episode boundary.  A consecutive-reset counter
+        # breaks any loop where the agent dies or times out immediately after
+        # each respawn — after MAX_CONSECUTIVE_RESETS we propagate done=True
+        # so the training loop can do a clean full reset.
+        if done and not self._virtual_table:
+            self._consecutive_resets += 1
+            if self._consecutive_resets <= self.MAX_CONSECUTIVE_RESETS:
+                # Run the internal reset on a background thread so a frozen
+                # Java process doesn't hang step() forever.
+                reset_result, reset_exc = [None], [None]
+                def _do_reset():
+                    try:
+                        reset_result[0] = self.env.reset()
+                    except Exception as e:
+                        reset_exc[0] = e
+                t = threading.Thread(target=_do_reset, daemon=True)
+                t.start()
+                t.join(timeout=180)
+                if t.is_alive() or reset_exc[0]:
+                    # Reset timed out or errored — propagate done=True so the
+                    # training loop can do a clean restart via _reset_with_timeout.
+                    print("[env] Internal reset timed out — propagating done=True")
+                else:
+                    obs = reset_result[0]
+                    self._prev_logs      = self._count_logs(obs)
+                    self._prev_tree_frac = 0.0
+                    self._was_alive      = True
+                    done = False
+            else:
+                print(f"[env] {self._consecutive_resets} consecutive resets — "
+                      "ending episode to allow full reset")
+        else:
+            self._consecutive_resets = 0
 
         return self._attach(obs), reward, done, info
 
@@ -225,7 +340,7 @@ class AutoCraftWrapper(gym.Wrapper):
 class ObservationWrapper(gym.ObservationWrapper):
     """
     Converts the MineRL obs dict into:
-      pov:       np.uint8  (3, 64, 64)  — CHW image, resized from 640×360
+      pov:       np.uint8  (3, 64, 64)  — CHW image, resized from 640×640
       inventory: np.float32 (3,)        — [logs, virtual_planks, virtual_table]
     """
 
@@ -247,7 +362,7 @@ class ObservationWrapper(gym.ObservationWrapper):
     def observation(self, obs):
         pov = obs["pov"][:, :, :3]           # drop alpha channel if present
 
-        # Resize 640×360 (or any size) → POV_SIZE × POV_SIZE using torch
+        # Resize 640×640 → POV_SIZE × POV_SIZE using torch
         pov_t = torch.as_tensor(pov.copy(), dtype=torch.float32
                                 ).permute(2, 0, 1).unsqueeze(0) / 255.0
         pov_t = torch.nn.functional.interpolate(
@@ -276,7 +391,7 @@ class ActionRepeatWrapper(gym.Wrapper):
     and the agent gets a reward signal much sooner.
     """
 
-    def __init__(self, env, repeat: int = 8):
+    def __init__(self, env, repeat: int = 16):
         super().__init__(env)
         self._repeat = repeat
 
@@ -290,11 +405,44 @@ class ActionRepeatWrapper(gym.Wrapper):
         return obs, total_reward, done, info
 
 
+WORLD_SEED = 175901257196164
+
+
+class FixedSeedWrapper(gym.Wrapper):
+    """Re-seeds the environment with a fixed value before every reset so the
+    same world is generated each episode."""
+
+    def reset(self):
+        self.env.seed(WORLD_SEED)
+        return self.env.reset()
+
+
+def _patch_jvm_memory(max_mem: str = "8G"):
+    """
+    Monkey-patch MinecraftInstance to use a larger JVM heap before gym.make().
+    The default is 4G which leaks and freezes after thousands of steps.
+    This avoids modifying any minerl source files.
+    """
+    try:
+        import minerl.env.malmo as _malmo
+        _orig = _malmo.MinecraftInstance.__init__
+        def _patched(self, port=None, existing=False, status_dir=None,
+                     seed=None, instance_id=None, max_mem=None):
+            _orig(self, port=port, existing=existing, status_dir=status_dir,
+                  seed=seed, instance_id=instance_id, max_mem=max_mem or "8G")
+        _malmo.MinecraftInstance.__init__ = _patched
+        print(f"[make_env] JVM heap set to {max_mem}")
+    except Exception as e:
+        print(f"[make_env] Warning: could not patch JVM memory: {e}")
+
+
 def make_env():
+    _patch_jvm_memory("8G")
     print("[make_env] Launching Minecraft Java process (can take 2–5 min on first run) …")
     env = gym.make("MineRLObtainDiamondShovel-v0")
-    env.seed(175901257196164)
+    env.seed(WORLD_SEED)
     print("[make_env] gym.make() done — wrapping env …")
+    env = FixedSeedWrapper(env)
     env = AutoCraftWrapper(env)
     env = PitchClampWrapper(env)
     env = DiscreteActionWrapper(env)
@@ -304,79 +452,7 @@ def make_env():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3.  Actor-Critic network
-# ──────────────────────────────────────────────────────────────────────────────
-
-class PolicyNet(nn.Module):
-    """
-    Actor-Critic network.
-
-    Inputs
-    ------
-    pov       : (B, 3, 64, 64) float32 in [0, 1]
-    inventory : (B, N_OBS_ITEMS) float32
-
-    Outputs
-    -------
-    logits : (B, N_ACTIONS)
-    value  : (B,)
-    """
-
-    def __init__(self, n_actions: int, n_inventory: int):
-        super().__init__()
-
-        # Visual encoder: 64×64 → 1024-d feature
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=8, stride=4),   # → (32, 15, 15)
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),  # → (64,  6,  6)
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),  # → (64,  4,  4)
-            nn.ReLU(),
-            nn.Flatten(),                                  # → 1024
-        )
-        cnn_out = 64 * 4 * 4  # 1024
-
-        # Inventory encoder
-        self.inv_enc = nn.Sequential(
-            nn.Linear(n_inventory, 64),
-            nn.ReLU(),
-        )
-
-        # Shared trunk
-        self.trunk = nn.Sequential(
-            nn.Linear(cnn_out + 64, 512),
-            nn.ReLU(),
-        )
-
-        # Separate actor / critic heads
-        self.actor  = nn.Linear(512, n_actions)
-        self.critic = nn.Linear(512, 1)
-
-        # Orthogonal weight initialisation (standard for PPO)
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.actor.weight,  gain=0.01)
-        nn.init.orthogonal_(self.critic.weight, gain=1.0)
-
-    def forward(self, pov, inventory):
-        vis    = self.cnn(pov)
-        inv    = self.inv_enc(inventory)
-        shared = self.trunk(torch.cat([vis, inv], dim=-1))
-        return self.actor(shared), self.critic(shared).squeeze(-1)
-
-    def get_action_and_value(self, pov, inventory, action=None):
-        logits, value = self.forward(pov, inventory)
-        dist = torch.distributions.Categorical(logits=logits)
-        if action is None:
-            action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 4.  PPO agent
+# 3.  PPO agent
 # ──────────────────────────────────────────────────────────────────────────────
 
 class PPOAgent:
@@ -384,6 +460,8 @@ class PPOAgent:
         self,
         n_actions:      int,
         n_inventory:    int,
+        vpt_model:      str,
+        vpt_weights:    str,
         lr:             float = 3e-4,
         gamma:          float = 0.99,
         gae_lambda:     float = 0.95,
@@ -395,16 +473,27 @@ class PPOAgent:
         minibatch_size: int   = 64,
         device:         str   = "cpu",
     ):
-        self.gamma         = gamma
-        self.gae_lambda    = gae_lambda
-        self.clip_eps      = clip_eps
-        self.ent_coef      = ent_coef
-        self.vf_coef       = vf_coef
-        self.max_grad_norm = max_grad_norm
-        self.n_epochs      = n_epochs
+        self.gamma          = gamma
+        self.gae_lambda     = gae_lambda
+        self.clip_eps       = clip_eps
+        self.ent_coef       = ent_coef
+        self.vf_coef        = vf_coef
+        self.max_grad_norm  = max_grad_norm
+        self.n_epochs       = n_epochs
         self.minibatch_size = minibatch_size
-        self.device        = device
-        self.policy    = PolicyNet(n_actions, n_inventory).to(device)
+        self.device         = device
+
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(__file__))
+        from vpt_policy import load_vpt_policy
+        self.policy = load_vpt_policy(
+            vpt_model_path=vpt_model,
+            vpt_weights_path=vpt_weights,
+            n_actions=n_actions,
+            n_inventory=n_inventory,
+            freeze_cnn=True,
+            device=device,
+        )
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, eps=1e-5)
 
     # ------------------------------------------------------------------
@@ -468,14 +557,27 @@ class PPOAgent:
         indices = np.arange(n)
         losses  = {"pg": 0.0, "vf": 0.0, "ent": 0.0}
 
+        # When the CNN is frozen its output is constant — pre-compute features
+        # once for the whole rollout instead of re-running it every minibatch
+        # across every epoch. Cuts PPO update time by ~(n_epochs * n_minibatches)x.
+        frozen_feats = None
+        if hasattr(self.policy, "cnn_is_frozen") and self.policy.cnn_is_frozen():
+            with torch.no_grad():
+                frozen_feats = self.policy.cnn(povs)
+
         for _ in range(self.n_epochs):
             np.random.shuffle(indices)
             for start in range(0, n, self.minibatch_size):
                 idx = indices[start : start + self.minibatch_size]
 
-                _, new_lps, entropy, new_vals = self.policy.get_action_and_value(
-                    povs[idx], invs[idx], actions[idx]
-                )
+                if frozen_feats is not None:
+                    _, new_lps, entropy, new_vals = self.policy.forward_from_features(
+                        frozen_feats[idx], invs[idx], actions[idx]
+                    )
+                else:
+                    _, new_lps, entropy, new_vals = self.policy.get_action_and_value(
+                        povs[idx], invs[idx], actions[idx]
+                    )
 
                 ratio = torch.exp(new_lps - old_lps[idx])
                 adv_b = advs[idx]
@@ -519,12 +621,40 @@ class PPOAgent:
 # 5.  Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _reset_with_timeout(env, timeout_sec: int = 180):
+    """
+    Call env.reset() on a background thread.  If it does not return within
+    timeout_sec seconds (Java process frozen), raise TimeoutError so the
+    training loop can save a checkpoint and exit rather than hanging forever.
+    """
+    result, exc = [None], [None]
+    def _worker():
+        try:
+            result[0] = env.reset()
+        except Exception as e:
+            exc[0] = e
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        raise TimeoutError(
+            f"env.reset() did not complete within {timeout_sec}s — "
+            "Minecraft Java process likely frozen"
+        )
+    if exc[0]:
+        raise exc[0]
+    return result[0]
+
+
 def train(
     total_timesteps: int = 500_000,
-    rollout_steps:   int = 2048,
+    rollout_steps:   int = 4096,
     save_dir:        str = "checkpoints",
     save_every:      int = 50_000,
     resume:          str = None,
+    vpt_model:       str = None,
+    vpt_weights:     str = None,
+    print_rewards:   bool = False,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[train] device={device}  total_timesteps={total_timesteps:,}")
@@ -541,6 +671,8 @@ def train(
     agent = PPOAgent(
         n_actions=N_ACTIONS,
         n_inventory=len(OBS_ITEMS),
+        vpt_model=vpt_model,
+        vpt_weights=vpt_weights,
         device=device,
     )
 
@@ -558,11 +690,13 @@ def train(
     print("[train] Calling env.reset() — world generation can take ~1 min …")
     obs = env.reset()
     print("[train] env.reset() done.")
-    ep_reward  = 0.0
-    ep_count   = 0
-    ep_rewards = deque(maxlen=20)
-    timestep   = start_step
-    next_save  = start_step + save_every
+    ep_reward            = 0.0
+    ep_count             = 0
+    ep_rewards           = deque(maxlen=20)
+    timestep             = start_step
+    next_save            = start_step + save_every
+    resets_since_restart = 0
+    RESTART_EVERY        = 5   # recreate the Java process every N full resets
 
     rollout = {k: [] for k in
                ("povs", "invs", "actions", "log_probs", "rewards", "values", "dones")}
@@ -570,93 +704,127 @@ def train(
     print("[train] Starting collection …")
     t0 = time.time()
 
-    while timestep < total_timesteps:
-        # ── Collect one rollout ──────────────────────────────────────────────
-        for _ in range(rollout_steps):
-            action, log_prob, value = agent.select_action(obs)
-            next_obs, reward, done, _ = env.step(action)
-            env.render()
+    try:
+        while timestep < total_timesteps:
+            # ── Collect one rollout ──────────────────────────────────────────
+            for _ in range(rollout_steps):
+                action, log_prob, value = agent.select_action(obs)
+                next_obs, reward, done, _ = env.step(action)
 
-            rollout["povs"].append(obs["pov"])
-            rollout["invs"].append(obs["inventory"])
-            rollout["actions"].append(action)
-            rollout["log_probs"].append(log_prob)
-            rollout["rewards"].append(float(reward))
-            rollout["values"].append(value)
-            rollout["dones"].append(float(done))
+                rollout["povs"].append(obs["pov"])
+                rollout["invs"].append(obs["inventory"])
+                rollout["actions"].append(action)
+                rollout["log_probs"].append(log_prob)
+                rollout["rewards"].append(float(reward))
+                rollout["values"].append(value)
+                rollout["dones"].append(float(done))
 
-            ep_reward += reward
-            obs        = next_obs
-            timestep  += 1
+                if print_rewards:
+                    print(f"  step {timestep:>7,d} | reward {reward:+.4f}")
 
-            if done:
-                ep_rewards.append(ep_reward)
-                ep_count  += 1
-                ep_reward  = 0.0
-                obs        = env.reset()
+                ep_reward += reward
+                obs        = next_obs
+                timestep  += 1
 
-        # ── PPO update ───────────────────────────────────────────────────────
-        metrics = agent.update(rollout, obs)
+                if done:
+                    ep_rewards.append(ep_reward)
+                    ep_count  += 1
+                    ep_reward  = 0.0
+                    resets_since_restart += 1
 
-        # Clear rollout buffers
-        for v in rollout.values():
-            v.clear()
+                    # Periodically kill and recreate the Java process to
+                    # prevent JVM heap accumulation from causing freezes.
+                    if resets_since_restart >= RESTART_EVERY:
+                        print("[train] Restarting Java process to clear JVM heap …")
+                        env.close()
+                        env = make_env()
+                        resets_since_restart = 0
 
-        # ── Logging ──────────────────────────────────────────────────────────
-        mean_rew  = float(np.mean(ep_rewards)) if ep_rewards else 0.0
-        fps       = rollout_steps / max(time.time() - t0, 1e-6)
-        t0        = time.time()
-        print(
-            f"step {timestep:>7,d} | ep {ep_count:>4d} | "
-            f"mean_rew {mean_rew:6.2f} | "
-            f"pg {metrics['pg']:+.4f} | vf {metrics['vf']:.4f} | "
-            f"ent {metrics['ent']:.4f} | fps {fps:.0f}"
-        )
+                    obs = _reset_with_timeout(env)
 
-        # ── Checkpointing ────────────────────────────────────────────────────
-        if timestep >= next_save:
-            path = os.path.join(save_dir, f"policy_{timestep}.pth")
-            agent.save(path)
-            print(f"[train] Checkpoint saved → {path}")
-            next_save += save_every
+            # ── PPO update ───────────────────────────────────────────────────
+            metrics = agent.update(rollout, obs)
 
-    # Final save
-    final_path = os.path.join(save_dir, "policy_final.pth")
-    agent.save(final_path)
-    print(f"[train] Training complete. Final model → {final_path}")
-    env.close()
+            for v in rollout.values():
+                v.clear()
+
+            # ── Logging ──────────────────────────────────────────────────────
+            mean_rew = float(np.mean(ep_rewards)) if ep_rewards else 0.0
+            fps      = rollout_steps / max(time.time() - t0, 1e-6)
+            t0       = time.time()
+            print(
+                f"step {timestep:>7,d} | ep {ep_count:>4d} | "
+                f"mean_rew {mean_rew:6.2f} | "
+                f"pg {metrics['pg']:+.4f} | vf {metrics['vf']:.4f} | "
+                f"ent {metrics['ent']:.4f} | fps {fps:.0f}"
+            )
+
+            # ── Checkpointing ────────────────────────────────────────────────
+            if timestep >= next_save:
+                path = os.path.join(save_dir, f"policy_{timestep}.pth")
+                agent.save(path)
+                print(f"[train] Checkpoint saved → {path}")
+                next_save += save_every
+
+    except (TimeoutError, KeyboardInterrupt) as e:
+        print(f"[train] Stopping early: {e}")
+
+    finally:
+        final_path = os.path.join(save_dir, f"policy_{timestep}.pth")
+        agent.save(final_path)
+        print(f"[train] Checkpoint saved → {final_path}")
+        env.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 6.  Evaluation loop
 # ──────────────────────────────────────────────────────────────────────────────
 
-def evaluate(checkpoint: str, n_episodes: int = 5):
+def evaluate(
+    checkpoint: str,
+    n_episodes: int = 5,
+    vpt_model:  str = "Video-Pre-Training/foundation-model-1x.model",
+    vpt_weights:str = "Video-Pre-Training/foundation-model-1x.weights",
+):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    env    = make_env()
 
-    agent = PPOAgent(n_actions=N_ACTIONS, n_inventory=len(OBS_ITEMS), device=device)
+    agent = PPOAgent(
+        n_actions=N_ACTIONS,
+        n_inventory=len(OBS_ITEMS),
+        vpt_model=vpt_model,
+        vpt_weights=vpt_weights,
+        device=device,
+    )
     agent.load(checkpoint)
     agent.policy.eval()
+    print(f"[eval] device={device}")
     print(f"[eval] Loaded {checkpoint}")
 
-    for ep in range(n_episodes):
-        obs        = env.reset()
-        total_rew  = 0.0
-        done       = False
-        steps      = 0
+    ep = 0
+    while ep < n_episodes:
+        # Recreate the env on each episode so a crashed Java process from the
+        # previous episode doesn't break subsequent ones.
+        env = make_env()
+        try:
+            obs       = _reset_with_timeout(env)
+            total_rew = 0.0
+            done      = False
+            steps     = 0
 
-        while not done:
-            with torch.no_grad():
-                action, _, _ = agent.select_action(obs)
-            obs, reward, done, _ = env.step(action)
-            total_rew += reward
-            steps     += 1
-            env.render()
+            while not done:
+                with torch.no_grad():
+                    action, _, _ = agent.select_action(obs)
+                obs, reward, done, _ = env.step(action)
+                total_rew += reward
+                steps     += 1
+                env.render()
 
-        print(f"  Episode {ep + 1:2d}: reward={total_rew:.2f}  steps={steps}")
-
-    env.close()
+            print(f"  Episode {ep + 1:2d}: reward={total_rew:.2f}  steps={steps}")
+            ep += 1
+        except Exception as e:
+            print(f"  Episode {ep + 1:2d}: env error ({e}) — restarting Java process")
+        finally:
+            env.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -681,10 +849,19 @@ if __name__ == "__main__":
     parser.add_argument("--save-every",   type=int, default=50_000)
     parser.add_argument("--episodes",     type=int, default=5,
                         help="Number of eval episodes (--eval only)")
+    parser.add_argument("--vpt-model",   type=str,
+                        default="Video-Pre-Training/foundation-model-1x.model",
+                        help="Path to VPT .model file")
+    parser.add_argument("--vpt-weights", type=str,
+                        default="Video-Pre-Training/foundation-model-1x.weights",
+                        help="Path to VPT .weights file")
+    parser.add_argument("--print-rewards", action="store_true",
+                        help="Print reward at every step during training")
     args = parser.parse_args()
 
     if args.eval:
-        evaluate(args.eval, n_episodes=args.episodes)
+        evaluate(args.eval, n_episodes=args.episodes,
+                 vpt_model=args.vpt_model, vpt_weights=args.vpt_weights)
     else:
         train(
             total_timesteps=args.timesteps,
@@ -692,4 +869,7 @@ if __name__ == "__main__":
             save_dir=args.save_dir,
             save_every=args.save_every,
             resume=args.resume,
+            vpt_model=args.vpt_model,
+            vpt_weights=args.vpt_weights,
+            print_rewards=args.print_rewards,
         )
