@@ -97,12 +97,11 @@ To number of episodes: `--episodes {# of episodes}` (default: 5)
 To print the rewards gained or lost at every step: `--print-rewards` (default: false)
 
 ## Current Reward System
-      +1.0   per new log collected
-      +0.5   per new log (planks bonus)
+      +0.5   per new log
       +10.0  when virtual crafting_table is first obtained  (episode ends)
       -5.0   when the agent dies (episode continues after respawn)
-      +0.03  each step the agent holds attack (sustained swing reward)
       +0.05  each step the center of view shows wood-colored pixels
       +0.08  when the tree fills a larger fraction of the view than last step
              (approach reward, gated on a minimum increase threshold)
+      -0.04  downward look penalty (added because agent would continually mine dirt)
 
