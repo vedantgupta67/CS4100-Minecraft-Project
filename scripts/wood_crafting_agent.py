@@ -850,10 +850,10 @@ if __name__ == "__main__":
     parser.add_argument("--episodes",     type=int, default=5,
                         help="Number of eval episodes (--eval only)")
     parser.add_argument("--vpt-model",   type=str,
-                        default="Video-Pre-Training/foundation-model-1x.model",
+                        default="./foundation-model-1x.model",
                         help="Path to VPT .model file")
     parser.add_argument("--vpt-weights", type=str,
-                        default="Video-Pre-Training/foundation-model-1x.weights",
+                        default="./foundation-model-1x.weights",
                         help="Path to VPT .weights file")
     parser.add_argument("--print-rewards", action="store_true",
                         help="Print reward at every step during training")
