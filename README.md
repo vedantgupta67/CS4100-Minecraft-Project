@@ -41,6 +41,47 @@ confirm installation with: pip list
 
 
 ## Windows Specific
-Install WSL Ubuntu version >22 and Java 8 onto it
+Install WSL Ubuntu version >22 and Temurin Java 8 onto it
 
 Should be able to run code after that!
+
+
+## Installing MineRL
+MineRL can take up to 30 minutes when installing, stay patient.
+
+## VPT Model
+To run the wood_crafting_agent.py file:
+
+git clone https://github.com/openai/Video-Pre-Training.git
+
+From https://github.com/openai/Video-Pre-Training
+
+Download 1x Model and 1x Width Weights from their README.md
+
+Place those files into /scripts
+
+By default wood_crafting_agent.py uses those files, if you want to specify a different path use the flags --vpt-model {path} and --vpt-weights {path}
+
+You can use different the 2x or 3x model and width weights, however, those are much larger and slower, but can produce better results than the 1x.
+## Checkpoints
+
+By default, wood_crafting_agent.py saves a .pth file to the /checkpoints folder every 50,000 steps
+
+To change the save directory for checkpoints: --save-dir {directory name} (default: checkpoints)
+
+You can change this using the --save-every {# of steps} flag
+
+To run a checkpoint, use the --resume {path} flag
+
+To evaluate a checkpoint, use the --eval {path} flag
+
+## Other Useful Arguments
+To change the total number of timesteps: --timesteps {# of timesteps} (default: 500,000)
+
+To change the rollout of stats: --rollout-steps {# of rollout-steps} (default: 2048)
+
+To number of episodes: --episodes {# of episodes} (default: 5)
+
+To print the rewards gained or lost at every step: --print-rewards (default: false)
+
+
