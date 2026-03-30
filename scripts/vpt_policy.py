@@ -42,11 +42,13 @@ The VPT CNN outputs exactly 1024-d for 64×64 input with the 1x foundation
 model, so the trunk and heads are drop-in compatible with the original PolicyNet.
 """
 
-import sys
-import os
+import logging
+
 import numpy as np
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # IMPALA CNN definition
@@ -168,7 +170,7 @@ class VPTPolicyNet(nn.Module):
 
         # Initialise everything except the pretrained CNN
         for m in [self.inv_enc, self.trunk, self.actor, self.critic]:
-            for layer in m.modules() if hasattr(m, 'modules') else [m]:
+            for layer in m.modules():
                 if isinstance(layer, nn.Linear):
                     nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
                     nn.init.zeros_(layer.bias)
@@ -182,7 +184,7 @@ class VPTPolicyNet(nn.Module):
         """Call this after ~50k PPO steps to fine-tune the full network."""
         for p in self.cnn.parameters():
             p.requires_grad_(True)
-        print("[VPTPolicyNet] CNN unfrozen — full network now trainable")
+        logger.info("CNN unfrozen — full network now trainable")
 
     def forward(self, pov, inventory):
         vis    = self.cnn(pov)
@@ -190,23 +192,22 @@ class VPTPolicyNet(nn.Module):
         shared = self.trunk(torch.cat([vis, inv], dim=-1))
         return self.actor(shared), self.critic(shared).squeeze(-1)
 
-    def forward_from_features(self, cnn_features, inventory, action=None):
-        """Skip the CNN — use pre-computed features. Faster when CNN is frozen."""
-        inv    = self.inv_enc(inventory)
-        shared = self.trunk(torch.cat([cnn_features, inv], dim=-1))
-        logits = self.actor(shared)
-        value  = self.critic(shared).squeeze(-1)
-        dist   = torch.distributions.Categorical(logits=logits)
-        if action is None:
-            action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value
-
-    def get_action_and_value(self, pov, inventory, action=None):
-        logits, value = self.forward(pov, inventory)
+    @staticmethod
+    def _act(logits, value, action):
         dist = torch.distributions.Categorical(logits=logits)
         if action is None:
             action = dist.sample()
         return action, dist.log_prob(action), dist.entropy(), value
+
+    def forward_from_features(self, cnn_features, inventory, action=None):
+        """Skip the CNN — use pre-computed features. Faster when CNN is frozen."""
+        inv    = self.inv_enc(inventory)
+        shared = self.trunk(torch.cat([cnn_features, inv], dim=-1))
+        return self._act(self.actor(shared), self.critic(shared).squeeze(-1), action)
+
+    def get_action_and_value(self, pov, inventory, action=None):
+        logits, value = self.forward(pov, inventory)
+        return self._act(logits, value, action)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -238,24 +239,16 @@ def load_vpt_policy(
         freeze_cnn=freeze_cnn,
     ).to(device)
 
-    print(f"[VPT] Loading weights from {vpt_weights_path} …")
-    raw = torch.load(vpt_weights_path, map_location=device)
+    logger.info("Loading weights from %s …", vpt_weights_path)
+    raw = torch.load(vpt_weights_path, map_location=device, weights_only=False)
 
     # VPT state dicts nest the CNN under "net.img_process" or similar keys.
     # We extract only the keys that belong to the IMPALA CNN stacks + linear.
-    cnn_prefix = "net.img_process."
-    cnn_state  = {}
-    for k, v in raw.items():
-        if k.startswith(cnn_prefix):
-            new_key = k[len(cnn_prefix):]   # strip prefix
-            cnn_state[new_key] = v
-
-    if not cnn_state:
-        # Try alternative key layout used in some VPT releases
-        alt_prefix = "img_process."
-        for k, v in raw.items():
-            if k.startswith(alt_prefix):
-                cnn_state[k[len(alt_prefix):]] = v
+    cnn_state = {}
+    for prefix in ("net.img_process.", "img_process."):
+        cnn_state = {k[len(prefix):]: v for k, v in raw.items() if k.startswith(prefix)}
+        if cnn_state:
+            break
 
     if not cnn_state:
         raise RuntimeError(
@@ -266,12 +259,12 @@ def load_vpt_policy(
 
     missing, unexpected = policy.cnn.load_state_dict(cnn_state, strict=False)
     if missing:
-        print(f"[VPT] Warning — missing CNN keys: {missing}")
+        logger.warning("Missing CNN keys: %s", missing)
     if unexpected:
-        print(f"[VPT] Warning — unexpected CNN keys: {unexpected}")
+        logger.warning("Unexpected CNN keys: %s", unexpected)
 
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     frozen    = sum(p.numel() for p in policy.cnn.parameters())
-    print(f"[VPT] CNN loaded ({frozen:,} params {'frozen' if freeze_cnn else 'trainable'})")
-    print(f"[VPT] Trainable params: {trainable:,}")
+    logger.info("CNN loaded (%s params %s)", f"{frozen:,}", "frozen" if freeze_cnn else "trainable")
+    logger.info("Trainable params: %s", f"{trainable:,}")
     return policy
