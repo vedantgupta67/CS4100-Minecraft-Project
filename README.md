@@ -103,7 +103,6 @@ To print the rewards gained or lost at every step: `--print-rewards` (default: f
       +0.05  each step the center of view shows wood-colored pixels
       +0.08  when the tree fills a larger fraction of the view than last step
              (approach reward, gated on a minimum increase threshold)
-      -0.04  downward look penalty (added because agent would continually mine dirt)
 
 ## PPO — How the Agent Learns
 
