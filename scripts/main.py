@@ -52,6 +52,10 @@ if __name__ == "__main__":
         format="%(asctime)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    # MineRL/Malmo emit very verbose INFO logs (Java render thread warnings,
+    # teleport ambiguity noise, quit attempts).  Cap them at WARNING so they
+    # don't drown out training output.
+    logging.getLogger("minerl").setLevel(logging.WARNING)
 
     if args.eval:
         from wood_crafting_agent import evaluate

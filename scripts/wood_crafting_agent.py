@@ -78,13 +78,11 @@ def train(
     obs = env.reset()
     logger.info("env.reset() done.")
 
-    ep_reward            = 0.0
-    ep_count             = 0
-    ep_rewards           = deque(maxlen=20)
-    timestep             = start_step
-    next_save            = start_step + save_every
-    resets_since_restart = 0
-    RESTART_EVERY        = 5
+    ep_reward  = 0.0
+    ep_count   = 0
+    ep_rewards = deque(maxlen=20)
+    timestep   = start_step
+    next_save  = start_step + save_every
 
     rollout = {k: [] for k in
                ("povs", "invs", "actions", "log_probs", "rewards", "values", "dones")}
@@ -116,16 +114,8 @@ def train(
 
                 if done:
                     ep_rewards.append(ep_reward)
-                    ep_count  += 1
-                    ep_reward  = 0.0
-                    resets_since_restart += 1
-
-                    if resets_since_restart >= RESTART_EVERY:
-                        logger.info("Restarting Java process to clear JVM heap …")
-                        env.close()
-                        env = make_env()
-                        resets_since_restart = 0
-
+                    ep_count += 1
+                    ep_reward = 0.0
                     obs = _reset_with_timeout(env)
 
             # ── PPO update ───────────────────────────────────────────────────
