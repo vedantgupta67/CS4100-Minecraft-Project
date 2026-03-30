@@ -151,6 +151,8 @@ class AutoCraftWrapper(gym.Wrapper):
     APPROACH_THRESH = 0.02
     DOWNWARD_LOOK_PENALTY = -0.04
 
+    MAX_CONSECUTIVE_RESETS = 5
+
     def __init__(self, env):
         super().__init__(env)
         self._prev_logs = 0
@@ -159,6 +161,7 @@ class AutoCraftWrapper(gym.Wrapper):
         self._virtual_table = False
         self._was_alive = True
         self._prev_tree_frac = 0.0
+        self._consecutive_resets = 0
         self._pitch = 0.0
 
     @staticmethod
