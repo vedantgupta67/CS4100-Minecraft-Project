@@ -30,8 +30,12 @@ logger = logging.getLogger(__name__)
 
 # Log types present in MC 1.16.5 inventory
 LOG_TYPES = [
-    "oak_log", "spruce_log", "birch_log",
-    "jungle_log", "acacia_log", "dark_oak_log",
+    "oak_log",
+    "spruce_log",
+    "birch_log",
+    "jungle_log",
+    "acacia_log",
+    "dark_oak_log",
 ]
 
 OBS_ITEMS = ["logs", "planks", "crafting_table"]
@@ -39,19 +43,19 @@ OBS_ITEMS = ["logs", "planks", "crafting_table"]
 # Each entry is a dict of action-key -> value overrides on top of a no-op base.
 # 'camera' values are [pitch_delta, yaw_delta] in degrees.
 DISCRETE_ACTIONS = [
-    {},                                    # 0:  no-op
-    {"forward": 1},                        # 1:  walk forward
-    {"back": 1},                           # 2:  walk back
-    {"left": 1},                           # 3:  strafe left
-    {"right": 1},                          # 4:  strafe right
-    {"jump": 1},                           # 5:  jump
-    {"sprint": 1, "forward": 1},           # 6:  sprint forward
-    {"attack": 1},                         # 7:  attack / mine
-    {"attack": 1, "forward": 1},           # 8:  mine while moving forward
-    {"camera": [0.0, -15.0]},             # 9:  turn left
-    {"camera": [0.0,  15.0]},             # 10: turn right
-    {"camera": [-15.0,  0.0]},            # 11: look up
-    {"camera": [ 15.0,  0.0]},            # 12: look down
+    {},  # 0:  no-op
+    {"forward": 1},  # 1:  walk forward
+    {"back": 1},  # 2:  walk back
+    {"left": 1},  # 3:  strafe left
+    {"right": 1},  # 4:  strafe right
+    {"jump": 1},  # 5:  jump
+    {"sprint": 1, "forward": 1},  # 6:  sprint forward
+    {"attack": 1},  # 7:  attack / mine
+    {"attack": 1, "forward": 1},  # 8:  mine while moving forward
+    {"camera": [0.0, -15.0]},  # 9:  turn left
+    {"camera": [0.0, 15.0]},  # 10: turn right
+    {"camera": [-15.0, 0.0]},  # 11: look up
+    {"camera": [15.0, 0.0]},  # 12: look down
 ]
 N_ACTIONS = len(DISCRETE_ACTIONS)
 
@@ -61,6 +65,7 @@ WORLD_SEED = 175901257196164
 # ──────────────────────────────────────────────────────────────────────────────
 # Wrappers
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class DiscreteActionWrapper(gym.ActionWrapper):
     """Maps integer action indices to MineRL Dict actions."""
@@ -94,7 +99,7 @@ class PitchClampWrapper(gym.Wrapper):
     """
 
     PITCH_MIN = -60.0
-    PITCH_MAX =  60.0
+    PITCH_MAX = 60.0
 
     def __init__(self, env):
         super().__init__(env)
@@ -110,7 +115,9 @@ class PitchClampWrapper(gym.Wrapper):
         clamped_delta = new_pitch - self._pitch
         if clamped_delta != delta:
             action = dict(action)
-            action["camera"] = np.array([clamped_delta, action["camera"][1]], dtype=np.float32)
+            action["camera"] = np.array(
+                [clamped_delta, action["camera"][1]], dtype=np.float32
+            )
         self._pitch = new_pitch
         return self.env.step(action)
 
@@ -136,26 +143,23 @@ class AutoCraftWrapper(gym.Wrapper):
       -0.04  downward look penalty (pitch > 45°)
     """
 
-    PLANKS_REWARD        =  0.5
-    TABLE_REWARD         = 10.0
-    DEATH_REWARD         = -5.0
-    LOOK_REWARD          =  0.05
-    APPROACH_REWARD      =  0.08
-    APPROACH_THRESH      =  0.02
+    PLANKS_REWARD = 0.5
+    TABLE_REWARD = 10.0
+    DEATH_REWARD = -5.0
+    LOOK_REWARD = 0.05
+    APPROACH_REWARD = 0.08
+    APPROACH_THRESH = 0.02
     DOWNWARD_LOOK_PENALTY = -0.04
-
-    MAX_CONSECUTIVE_RESETS = 5
 
     def __init__(self, env):
         super().__init__(env)
-        self._prev_logs          = 0
-        self._total_logs         = 0
-        self._virtual_planks     = 0
-        self._virtual_table      = False
-        self._was_alive          = True
-        self._prev_tree_frac     = 0.0
-        self._consecutive_resets = 0
-        self._pitch              = 0.0
+        self._prev_logs = 0
+        self._total_logs = 0
+        self._virtual_planks = 0
+        self._virtual_table = False
+        self._was_alive = True
+        self._prev_tree_frac = 0.0
+        self._pitch = 0.0
 
     @staticmethod
     def _count_logs(obs) -> int:
@@ -182,25 +186,25 @@ class AutoCraftWrapper(gym.Wrapper):
         h, w = pov.shape[:2]
         mh, mw = max(1, h // 7), max(1, w // 7)
         cy, cx = h // 2, w // 2
-        center = pov[cy - mh: cy + mh, cx - mw: cx + mw].astype(np.float32)
+        center = pov[cy - mh : cy + mh, cx - mw : cx + mw].astype(np.float32)
         return float(np.mean(AutoCraftWrapper._wood_mask(center))) > 0.25
 
     def _attach(self, obs):
-        obs["_logs"]           = self._total_logs
+        obs["_logs"] = self._total_logs
         obs["_virtual_planks"] = self._virtual_planks
-        obs["_virtual_table"]  = int(self._virtual_table)
+        obs["_virtual_table"] = int(self._virtual_table)
         return obs
 
     def reset(self):
         obs = self.env.reset()
-        self._prev_logs          = self._count_logs(obs)
-        self._total_logs         = 0
-        self._virtual_planks     = 0
-        self._virtual_table      = False
-        self._was_alive          = True
-        self._prev_tree_frac     = 0.0
+        self._prev_logs = self._count_logs(obs)
+        self._total_logs = 0
+        self._virtual_planks = 0
+        self._virtual_table = False
+        self._was_alive = True
+        self._prev_tree_frac = 0.0
         self._consecutive_resets = 0
-        self._pitch              = 0.0
+        self._pitch = 0.0
         return self._attach(obs)
 
     def step(self, action):
@@ -211,14 +215,14 @@ class AutoCraftWrapper(gym.Wrapper):
         self._was_alive = is_alive
 
         curr_logs = self._count_logs(obs)
-        new_logs  = max(0, curr_logs - self._prev_logs)
+        new_logs = max(0, curr_logs - self._prev_logs)
         self._prev_logs = curr_logs
 
         reward = float(new_logs)
         if new_logs > 0:
-            self._total_logs     += new_logs
+            self._total_logs += new_logs
             self._virtual_planks += new_logs * 4
-            reward               += self.PLANKS_REWARD * new_logs
+            reward += self.PLANKS_REWARD * new_logs
 
         if died:
             reward += self.DEATH_REWARD
@@ -226,7 +230,7 @@ class AutoCraftWrapper(gym.Wrapper):
         if not self._virtual_table and self._virtual_planks >= 4:
             self._virtual_table = True
             reward += self.TABLE_REWARD
-            done    = True
+            done = True
 
         self._pitch += float(action.get("camera", [0.0, 0.0])[0])
         if self._pitch > 45.0:
@@ -246,9 +250,9 @@ class AutoCraftWrapper(gym.Wrapper):
             if self._consecutive_resets <= self.MAX_CONSECUTIVE_RESETS:
                 try:
                     obs = _reset_with_timeout(self.env)
-                    self._prev_logs      = self._count_logs(obs)
+                    self._prev_logs = self._count_logs(obs)
                     self._prev_tree_frac = 0.0
-                    self._was_alive      = True
+                    self._was_alive = True
                     done = False
                 except Exception:
                     logger.warning("Internal reset timed out — propagating done=True")
@@ -274,31 +278,43 @@ class ObservationWrapper(gym.ObservationWrapper):
 
     def __init__(self, env):
         super().__init__(env)
-        self.observation_space = gym.spaces.Dict({
-            "pov": gym.spaces.Box(
-                low=0, high=255,
-                shape=(3, self.POV_SIZE, self.POV_SIZE),
-                dtype=np.uint8,
-            ),
-            "inventory": gym.spaces.Box(
-                low=0, high=2304, shape=(len(OBS_ITEMS),), dtype=np.float32
-            ),
-        })
+        self.observation_space = gym.spaces.Dict(
+            {
+                "pov": gym.spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(3, self.POV_SIZE, self.POV_SIZE),
+                    dtype=np.uint8,
+                ),
+                "inventory": gym.spaces.Box(
+                    low=0, high=2304, shape=(len(OBS_ITEMS),), dtype=np.float32
+                ),
+            }
+        )
 
     def observation(self, obs):
         pov = obs["pov"][:, :, :3]
-        pov_t = torch.as_tensor(pov.copy(), dtype=torch.float32
-                                ).permute(2, 0, 1).unsqueeze(0) / 255.0
+        pov_t = (
+            torch.as_tensor(pov.copy(), dtype=torch.float32)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            / 255.0
+        )
         pov_t = torch.nn.functional.interpolate(
-            pov_t, size=(self.POV_SIZE, self.POV_SIZE),
-            mode="bilinear", align_corners=False,
+            pov_t,
+            size=(self.POV_SIZE, self.POV_SIZE),
+            mode="bilinear",
+            align_corners=False,
         )
         pov = (pov_t.squeeze(0) * 255).byte().numpy()
-        inv = np.array([
-            float(obs.get("_logs",           0)),
-            float(obs.get("_virtual_planks", 0)),
-            float(obs.get("_virtual_table",  0)),
-        ], dtype=np.float32)
+        inv = np.array(
+            [
+                float(obs.get("_logs", 0)),
+                float(obs.get("_virtual_planks", 0)),
+                float(obs.get("_virtual_table", 0)),
+            ],
+            dtype=np.float32,
+        )
         return {"pov": pov, "inventory": inv}
 
 
@@ -336,17 +352,20 @@ class FixedSeedWrapper(gym.Wrapper):
 # Factory and utilities
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _reset_with_timeout(env, timeout_sec: int = 180):
     """
     Call env.reset() on a background thread.  Raises TimeoutError if it does
     not return within timeout_sec seconds (Java process frozen).
     """
     result, exc = [None], [None]
+
     def _worker():
         try:
             result[0] = env.reset()
         except Exception as e:
             exc[0] = e
+
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     t.join(timeout_sec)
@@ -368,13 +387,30 @@ def _patch_jvm_memory():
     """
     try:
         import minerl.env.malmo as _malmo
+
         if getattr(_malmo.MinecraftInstance, "_jvm_patched", False):
             return
         _orig = _malmo.MinecraftInstance.__init__
-        def _patched(self, port=None, existing=False, status_dir=None,
-                     seed=None, instance_id=None, max_mem=None):
-            _orig(self, port=port, existing=existing, status_dir=status_dir,
-                  seed=seed, instance_id=instance_id, max_mem=max_mem or "8G")
+
+        def _patched(
+            self,
+            port=None,
+            existing=False,
+            status_dir=None,
+            seed=None,
+            instance_id=None,
+            max_mem=None,
+        ):
+            _orig(
+                self,
+                port=port,
+                existing=existing,
+                status_dir=status_dir,
+                seed=seed,
+                instance_id=instance_id,
+                max_mem=max_mem or "8G",
+            )
+
         _malmo.MinecraftInstance.__init__ = _patched
         _malmo.MinecraftInstance._jvm_patched = True
         logger.info("JVM heap set to 8G")

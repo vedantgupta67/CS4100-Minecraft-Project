@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 # Reproduced here so you don't need to add the full VPT repo to sys.path.
 # This matches the architecture used in the VPT foundation models exactly.
 
+
 class _ResidualBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
@@ -73,10 +74,10 @@ class _ResidualBlock(nn.Module):
 class _ImpalaStack(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv    = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.pool    = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.res0    = _ResidualBlock(out_channels)
-        self.res1    = _ResidualBlock(out_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.res0 = _ResidualBlock(out_channels)
+        self.res1 = _ResidualBlock(out_channels)
 
     def forward(self, x):
         x = self.conv(x)
@@ -102,17 +103,17 @@ class ImpalaCNN(nn.Module):
         chans = [c * width_multiplier for c in self.BASE_CHANNELS]
 
         stacks = []
-        in_ch  = 3
+        in_ch = 3
         for out_ch in chans:
             stacks.append(_ImpalaStack(in_ch, out_ch))
             in_ch = out_ch
-        self.stacks  = nn.Sequential(*stacks)
+        self.stacks = nn.Sequential(*stacks)
         self.flatten = nn.Flatten()
 
         # Compute flattened size for 64×64 input
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 64, 64)
-            flat  = self.flatten(self.stacks(dummy))
+            flat = self.flatten(self.stacks(dummy))
             flat_size = flat.shape[1]
 
         self.linear = nn.Linear(flat_size, output_size)
@@ -128,6 +129,7 @@ class ImpalaCNN(nn.Module):
 # VPT-backed PolicyNet
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class VPTPolicyNet(nn.Module):
     """
     Drop-in replacement for PolicyNet that uses VPT's IMPALA CNN as the
@@ -137,14 +139,14 @@ class VPTPolicyNet(nn.Module):
     so checkpoints for those layers are interchangeable.
     """
 
-    CNN_OUT = 1024   # output size of ImpalaCNN — matches original PolicyNet
+    CNN_OUT = 1024  # output size of ImpalaCNN — matches original PolicyNet
 
     def __init__(
         self,
-        n_actions:         int,
-        n_inventory:       int,
-        width_multiplier:  int  = 1,
-        freeze_cnn:        bool = True,
+        n_actions: int,
+        n_inventory: int,
+        width_multiplier: int = 1,
+        freeze_cnn: bool = True,
     ):
         super().__init__()
 
@@ -165,7 +167,7 @@ class VPTPolicyNet(nn.Module):
             nn.Linear(self.CNN_OUT + 64, 512),
             nn.ReLU(),
         )
-        self.actor  = nn.Linear(512, n_actions)
+        self.actor = nn.Linear(512, n_actions)
         self.critic = nn.Linear(512, 1)
 
         # Initialise everything except the pretrained CNN
@@ -174,7 +176,7 @@ class VPTPolicyNet(nn.Module):
                 if isinstance(layer, nn.Linear):
                     nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
                     nn.init.zeros_(layer.bias)
-        nn.init.orthogonal_(self.actor.weight,  gain=0.01)
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
 
     def cnn_is_frozen(self) -> bool:
@@ -187,8 +189,8 @@ class VPTPolicyNet(nn.Module):
         logger.info("CNN unfrozen — full network now trainable")
 
     def forward(self, pov, inventory):
-        vis    = self.cnn(pov)
-        inv    = self.inv_enc(inventory)
+        vis = self.cnn(pov)
+        inv = self.inv_enc(inventory)
         shared = self.trunk(torch.cat([vis, inv], dim=-1))
         return self.actor(shared), self.critic(shared).squeeze(-1)
 
@@ -201,7 +203,7 @@ class VPTPolicyNet(nn.Module):
 
     def forward_from_features(self, cnn_features, inventory, action=None):
         """Skip the CNN — use pre-computed features. Faster when CNN is frozen."""
-        inv    = self.inv_enc(inventory)
+        inv = self.inv_enc(inventory)
         shared = self.trunk(torch.cat([cnn_features, inv], dim=-1))
         return self._act(self.actor(shared), self.critic(shared).squeeze(-1), action)
 
@@ -214,13 +216,14 @@ class VPTPolicyNet(nn.Module):
 # Weight loader
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def load_vpt_policy(
-    vpt_model_path:   str,
+    vpt_model_path: str,
     vpt_weights_path: str,
-    n_actions:        int,
-    n_inventory:      int,
-    freeze_cnn:       bool = True,
-    device:           str  = "cpu",
+    n_actions: int,
+    n_inventory: int,
+    freeze_cnn: bool = True,
+    device: str = "cpu",
 ) -> VPTPolicyNet:
     """
     Build a VPTPolicyNet and load the pretrained IMPALA CNN weights from a
@@ -246,7 +249,9 @@ def load_vpt_policy(
     # We extract only the keys that belong to the IMPALA CNN stacks + linear.
     cnn_state = {}
     for prefix in ("net.img_process.", "img_process."):
-        cnn_state = {k[len(prefix):]: v for k, v in raw.items() if k.startswith(prefix)}
+        cnn_state = {
+            k[len(prefix) :]: v for k, v in raw.items() if k.startswith(prefix)
+        }
         if cnn_state:
             break
 
@@ -264,7 +269,11 @@ def load_vpt_policy(
         logger.warning("Unexpected CNN keys: %s", unexpected)
 
     trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    frozen    = sum(p.numel() for p in policy.cnn.parameters())
-    logger.info("CNN loaded (%s params %s)", f"{frozen:,}", "frozen" if freeze_cnn else "trainable")
+    frozen = sum(p.numel() for p in policy.cnn.parameters())
+    logger.info(
+        "CNN loaded (%s params %s)",
+        f"{frozen:,}",
+        "frozen" if freeze_cnn else "trainable",
+    )
     logger.info("Trainable params: %s", f"{trainable:,}")
     return policy

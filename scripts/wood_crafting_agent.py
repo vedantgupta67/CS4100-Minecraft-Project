@@ -39,22 +39,23 @@ logger = logging.getLogger(__name__)
 # 1.  Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def train(
-    total_timesteps: int  = 500_000,
-    rollout_steps:   int  = 4096,
-    save_dir:        str  = "checkpoints",
-    save_every:      int  = 50_000,
-    resume:          str  = None,
-    vpt_model:       str  = None,
-    vpt_weights:     str  = None,
-    print_rewards:   bool = False,
+    total_timesteps: int = 500_000,
+    rollout_steps: int = 4096,
+    save_dir: str = "checkpoints",
+    save_every: int = 50_000,
+    resume: str = None,
+    vpt_model: str = None,
+    vpt_weights: str = None,
+    print_rewards: bool = False,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("device=%s  total_timesteps=%s", device, f"{total_timesteps:,}")
 
     os.makedirs(save_dir, exist_ok=True)
 
-    env   = make_env()
+    env = make_env()
     agent = PPOAgent(
         n_actions=N_ACTIONS,
         n_inventory=len(OBS_ITEMS),
@@ -78,14 +79,16 @@ def train(
     obs = env.reset()
     logger.info("env.reset() done.")
 
-    ep_reward  = 0.0
-    ep_count   = 0
+    ep_reward = 0.0
+    ep_count = 0
     ep_rewards = deque(maxlen=20)
-    timestep   = start_step
-    next_save  = start_step + save_every
+    timestep = start_step
+    next_save = start_step + save_every
 
-    rollout = {k: [] for k in
-               ("povs", "invs", "actions", "log_probs", "rewards", "values", "dones")}
+    rollout = {
+        k: []
+        for k in ("povs", "invs", "actions", "log_probs", "rewards", "values", "dones")
+    }
 
     logger.info("Starting collection …")
     t0 = time.time()
@@ -109,8 +112,8 @@ def train(
                     logger.debug("step %7s | reward %+.4f", f"{timestep:,}", reward)
 
                 ep_reward += reward
-                obs        = next_obs
-                timestep  += 1
+                obs = next_obs
+                timestep += 1
 
                 if done:
                     ep_rewards.append(ep_reward)
@@ -125,13 +128,18 @@ def train(
 
             # ── Logging ──────────────────────────────────────────────────────
             mean_rew = float(np.mean(ep_rewards)) if ep_rewards else 0.0
-            fps      = rollout_steps / max(time.time() - t0, 1e-6)
-            t0       = time.time()
+            fps = rollout_steps / max(time.time() - t0, 1e-6)
+            t0 = time.time()
             logger.info(
                 "step %s | ep %4d | mean_rew %6.2f | "
                 "pg %+.4f | vf %.4f | ent %.4f | fps %.0f",
-                f"{timestep:>7,}", ep_count, mean_rew,
-                metrics["pg"], metrics["vf"], metrics["ent"], fps,
+                f"{timestep:>7,}",
+                ep_count,
+                mean_rew,
+                metrics["pg"],
+                metrics["vf"],
+                metrics["ent"],
+                fps,
             )
 
             # ── Checkpointing ────────────────────────────────────────────────
@@ -155,10 +163,11 @@ def train(
 # 2.  Evaluation loop
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def evaluate(
-    checkpoint:  str,
-    n_episodes:  int = 5,
-    vpt_model:   str = "./scripts/foundation-model-1x.model",
+    checkpoint: str,
+    n_episodes: int = 5,
+    vpt_model: str = "./scripts/foundation-model-1x.model",
     vpt_weights: str = "./scripts/foundation-model-1x.weights",
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -179,22 +188,23 @@ def evaluate(
     while ep < n_episodes:
         env = make_env()
         try:
-            obs       = _reset_with_timeout(env)
+            obs = _reset_with_timeout(env)
             total_rew = 0.0
-            done      = False
-            steps     = 0
+            done = False
+            steps = 0
 
             while not done:
                 action, _, _ = agent.select_action(obs)
                 obs, reward, done, _ = env.step(action)
                 total_rew += reward
-                steps     += 1
+                steps += 1
                 env.render()
 
             logger.info("Episode %2d: reward=%.2f  steps=%d", ep + 1, total_rew, steps)
             ep += 1
         except Exception as e:
-            logger.warning("Episode %2d: env error (%s) — restarting Java process", ep + 1, e)
+            logger.warning(
+                "Episode %2d: env error (%s) — restarting Java process", ep + 1, e
+            )
         finally:
             env.close()
-
