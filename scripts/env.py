@@ -140,7 +140,6 @@ class AutoCraftWrapper(gym.Wrapper):
       +0.05  each step the center of view shows wood-colored pixels
       +0.08  when the tree fills a larger fraction of the view than last step
              (approach reward, gated on a minimum increase threshold)
-      -0.04  downward look penalty (pitch > 45°)
     """
 
     PLANKS_REWARD = 0.5
@@ -149,7 +148,6 @@ class AutoCraftWrapper(gym.Wrapper):
     LOOK_REWARD = 0.05
     APPROACH_REWARD = 0.08
     APPROACH_THRESH = 0.02
-    DOWNWARD_LOOK_PENALTY = -0.04
 
     MAX_CONSECUTIVE_RESETS = 5
 
@@ -234,10 +232,6 @@ class AutoCraftWrapper(gym.Wrapper):
             self._virtual_table = True
             reward += self.TABLE_REWARD
             done = True
-
-        self._pitch += float(action.get("camera", [0.0, 0.0])[0])
-        if self._pitch > 45.0:
-            reward += self.DOWNWARD_LOOK_PENALTY
 
         pov = obs.get("pov")
         if pov is not None and pov.ndim == 3 and pov.shape[2] >= 3:
