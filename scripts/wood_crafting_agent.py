@@ -25,7 +25,10 @@ Usage
 """
 
 import argparse
+import copy
+import json
 import os
+import random
 import time
 import warnings
 from collections import deque
@@ -40,6 +43,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1.  Environment
@@ -80,10 +84,10 @@ DISCRETE_ACTIONS = [
     {"sprint": 1, "forward": 1},            # 6:  sprint forward
     {"attack": 1},                          # 7:  attack / mine
     {"attack": 1, "forward": 1},            # 8:  mine while moving forward
-    {"camera": [0.0, -15.0]},              # 9:  turn left
-    {"camera": [0.0,  15.0]},              # 10: turn right
-    {"camera": [-15.0,  0.0]},             # 11: look up
-    {"camera": [ 15.0,  0.0]},             # 12: look down
+    {"camera": [0.0, -5.0]},               # 9:  turn left
+    {"camera": [0.0,  5.0]},               # 10: turn right
+    {"camera": [-5.0,  0.0]},              # 11: look up
+    {"camera": [ 5.0,  0.0]},              # 12: look down
 ]
 N_ACTIONS = len(DISCRETE_ACTIONS)
 
@@ -298,9 +302,480 @@ def make_env():
     env = AutoCraftWrapper(env)
     env = PitchClampWrapper(env)
     env = DiscreteActionWrapper(env)
-    env = ActionRepeatWrapper(env, repeat=4)
+    env = ActionRepeatWrapper(env, repeat=8)
     env = ObservationWrapper(env)
     return env
+
+
+import signal
+
+class ResetTimeoutError(BaseException):
+    pass
+
+def _timeout_handler(signum, frame):
+    raise ResetTimeoutError("env.reset() timed out!")
+
+def reset_env_with_retries(
+    env,
+    make_env_fn,
+    max_retries: int = 5,
+    retry_sleep: float = 5.0,
+    reset_timeout: int = 90,
+):
+    """
+    Attempt env.reset() with retries and a hard SIGALRM timeout.
+
+    MineRL can intermittently fail mission reset/handshake (socket hanging); 
+    when that happens we enforce a timeout, recreate the environment process, 
+    and retry to keep long training runs alive.
+    Returns a tuple of (obs, env), where env may be a recreated instance.
+    """
+    last_exc = None
+    current_env = env
+    
+    # Register the signal handler for SIGALRM
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"[train] Starting env.reset() ... (will timeout and restart after {reset_timeout}s if it hangs)")
+            # Set the alarm
+            signal.alarm(int(reset_timeout))
+            
+            obs = current_env.reset()
+            
+            # Disable the alarm on success
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+            return obs, current_env
+            
+        except ResetTimeoutError as exc:
+            signal.alarm(0)
+            last_exc = exc
+            print(f"[train] env.reset() timed out (attempt {attempt}/{max_retries})")
+        except Exception as exc:
+            signal.alarm(0)
+            last_exc = exc
+            print(f"[train] env.reset() failed (attempt {attempt}/{max_retries}): {exc}")
+
+        # If we reach here, it failed or timed out.
+        try:
+            # 1. Kill the malmo process aggressively FIRST to unblock any hanging sockets
+            if hasattr(current_env, "unwrapped") and hasattr(current_env.unwrapped, "instances"):
+                for inst in current_env.unwrapped.instances:
+                    if hasattr(inst, "kill"):
+                        try:
+                            inst.kill()
+                        except Exception:
+                            pass
+            
+            # 2. Skip polite close() if we timed out because the socket is 100% stuck
+            if not isinstance(last_exc, ResetTimeoutError):
+                current_env.close()
+        except Exception:
+            pass
+
+        if attempt < max_retries:
+            print("[train] Recreating environment and retrying reset …")
+            time.sleep(max(0.0, retry_sleep))
+            current_env = make_env_fn()
+
+    # Restore the original signal handler before raising
+    signal.signal(signal.SIGALRM, old_handler)
+    raise RuntimeError(
+        f"env.reset() failed after {max_retries} attempts. Last error: {last_exc}"
+    ) from last_exc
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2b. Imitation warm start (behavior cloning)
+# ──────────────────────────────────────────────────────────────────────────────
+
+CAMERA_DEADZONE = 3.0
+
+
+def _to_float(x) -> float:
+    arr = np.asarray(x)
+    return float(arr.reshape(-1)[0]) if arr.size > 0 else 0.0
+
+
+def _to_int(x) -> int:
+    return int(round(_to_float(x)))
+
+
+def preprocess_pov(pov: np.ndarray, size: int = ObservationWrapper.POV_SIZE) -> np.ndarray:
+    """Match ObservationWrapper's POV preprocessing for BC dataset samples."""
+    pov = pov[:, :, :3]
+    pov_t = torch.as_tensor(pov.copy(), dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
+    pov_t = torch.nn.functional.interpolate(
+        pov_t,
+        size=(size, size),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return (pov_t.squeeze(0) * 255).byte().numpy()
+
+
+def obs_to_inventory_features(obs: dict) -> np.ndarray:
+    """Build the inventory vector used by the online policy from raw MineRL obs."""
+    logs = 0.0
+    inv = obs.get("inventory", {})
+    if isinstance(inv, dict):
+        logs = float(sum(int(inv.get(t, 0)) for t in LOG_TYPES))
+    return np.array([logs, 0.0, 0.0], dtype=np.float32)
+
+
+def map_demo_action_to_discrete(action: dict) -> int:
+    """Project a MineRL Dict action into this script's discrete action set."""
+    attack = _to_int(action.get("attack", 0))
+    forward = _to_int(action.get("forward", 0))
+    back = _to_int(action.get("back", 0))
+    left = _to_int(action.get("left", 0))
+    right = _to_int(action.get("right", 0))
+    jump = _to_int(action.get("jump", 0))
+    sprint = _to_int(action.get("sprint", 0))
+
+    cam = np.asarray(action.get("camera", np.array([0.0, 0.0], dtype=np.float32))).reshape(-1)
+    pitch = float(cam[0]) if cam.size > 0 else 0.0
+    yaw = float(cam[1]) if cam.size > 1 else 0.0
+
+    if attack and forward:
+        return 8
+    if attack:
+        return 7
+    if sprint and forward:
+        return 6
+    if jump:
+        return 5
+    if forward:
+        return 1
+    if back:
+        return 2
+    if left:
+        return 3
+    if right:
+        return 4
+
+    abs_pitch = abs(pitch)
+    abs_yaw = abs(yaw)
+    if abs_pitch >= CAMERA_DEADZONE or abs_yaw >= CAMERA_DEADZONE:
+        if abs_yaw >= abs_pitch:
+            return 10 if yaw > 0 else 9
+        return 12 if pitch > 0 else 11
+
+    return 0
+
+
+def _find_recording_dirs(root_dir: str):
+    recording_dirs = []
+    for dirpath, _dirnames, filenames in os.walk(root_dir):
+        has_video = "recording.mp4" in filenames
+        has_univ = "univ.json" in filenames
+        has_npz = "rendered.npz" in filenames
+        if has_video and (has_univ or has_npz):
+            recording_dirs.append(dirpath)
+    return recording_dirs
+
+
+def _extract_action_from_universal(frame_dict: dict) -> dict:
+    if isinstance(frame_dict.get("action"), dict):
+        return frame_dict["action"]
+
+    action = {}
+    for key in ("attack", "forward", "back", "left", "right", "jump", "sprint", "camera"):
+        if key in frame_dict:
+            action[key] = frame_dict[key]
+
+    if "camera" not in action:
+        pitch = frame_dict.get("cameraPitch", 0.0)
+        yaw = frame_dict.get("cameraYaw", 0.0)
+        action["camera"] = [pitch, yaw]
+    return action
+
+
+def _build_imitation_dataset_from_recordings(
+    data_dir: str,
+    max_trajectories: int,
+    max_samples: int,
+    seed: int,
+):
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError(
+            "BC fallback requires OpenCV. Install opencv-python or use an environment "
+            "with minerl.data available."
+        ) from exc
+
+    if not data_dir:
+        raise RuntimeError(
+            "BC fallback needs --bc-data-dir pointing to recordings containing "
+            "recording.mp4 plus either univ.json or rendered.npz."
+        )
+
+    if not os.path.isdir(data_dir):
+        raise RuntimeError(f"BC data dir does not exist: {data_dir}")
+
+    random.seed(seed)
+    recording_dirs = _find_recording_dirs(data_dir)
+    if not recording_dirs:
+        raise RuntimeError(
+            "No recordings found under --bc-data-dir. Expected trajectory folders "
+            "with recording.mp4 plus either univ.json or rendered.npz."
+        )
+
+    random.shuffle(recording_dirs)
+    recording_dirs = recording_dirs[:max_trajectories]
+
+    print(
+        f"[bc] Using raw-recording fallback from {data_dir} "
+        f"(trajectories={len(recording_dirs)}, max_samples={max_samples:,})"
+    )
+
+    povs, invs, actions = [], [], []
+    for traj_i, rec_dir in enumerate(recording_dirs, start=1):
+        video_path = os.path.join(rec_dir, "recording.mp4")
+        univ_path = os.path.join(rec_dir, "univ.json")
+        npz_path = os.path.join(rec_dir, "rendered.npz")
+
+        raw_univ = None
+        frame_keys = None
+        act_npz = None
+        if os.path.isfile(univ_path):
+            with open(univ_path, "r", encoding="utf-8") as f:
+                raw_univ = json.load(f)
+            frame_keys = sorted((int(k) for k in raw_univ.keys()))
+        elif os.path.isfile(npz_path):
+            act_npz = np.load(npz_path)
+        else:
+            continue
+
+        cap = cv2.VideoCapture(video_path)
+        used = 0
+        frame_i = 0
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            frame_rgb = frame_bgr[:, :, ::-1]
+
+            if raw_univ is not None:
+                if frame_i >= len(frame_keys):
+                    break
+                key = frame_keys[frame_i]
+                frame_data = raw_univ.get(str(key), {})
+                obs = {
+                    "pov": frame_rgb,
+                    "inventory": frame_data.get("inventory", {}),
+                }
+                act = _extract_action_from_universal(frame_data)
+            else:
+                # rendered.npz format stores action arrays aligned by frame index.
+                n_steps = len(act_npz["action$forward"])
+                if frame_i >= n_steps:
+                    break
+                obs = {
+                    "pov": frame_rgb,
+                    "inventory": {},
+                }
+                cam = act_npz["action$camera"][frame_i]
+                act = {
+                    "attack": int(act_npz["action$attack"][frame_i]),
+                    "forward": int(act_npz["action$forward"][frame_i]),
+                    "back": int(act_npz["action$back"][frame_i]),
+                    "left": int(act_npz["action$left"][frame_i]),
+                    "right": int(act_npz["action$right"][frame_i]),
+                    "jump": int(act_npz["action$jump"][frame_i]),
+                    "sprint": int(act_npz["action$sprint"][frame_i]),
+                    "camera": [float(cam[0]), float(cam[1])],
+                }
+
+            povs.append(preprocess_pov(obs["pov"]))
+            invs.append(obs_to_inventory_features(obs))
+            actions.append(map_demo_action_to_discrete(act))
+            used += 1
+            frame_i += 1
+
+            if len(actions) >= max_samples:
+                break
+
+        cap.release()
+        if act_npz is not None:
+            act_npz.close()
+        print(f"[bc] Fallback trajectory {traj_i:>3d}: {rec_dir}  steps_used={used}")
+        if len(actions) >= max_samples:
+            break
+
+    if not actions:
+        raise RuntimeError("Fallback loader found recordings but produced 0 BC samples.")
+
+    return (
+        np.asarray(povs, dtype=np.uint8),
+        np.asarray(invs, dtype=np.float32),
+        np.asarray(actions, dtype=np.int64),
+    )
+
+
+def build_imitation_dataset(
+    env_id: str = "MineRLObtainDiamondShovel-v0",
+    data_dir: str = None,
+    max_trajectories: int = 40,
+    max_samples: int = 120_000,
+    seed: int = 0,
+):
+    """Load MineRL demonstrations and convert them to supervised BC tensors."""
+    random.seed(seed)
+
+    # Preferred path: official MineRL dataset API.
+    try:
+        import importlib
+
+        minerl_data = importlib.import_module("minerl.data")
+        print(
+            f"[bc] Loading MineRL data for {env_id} "
+            f"(max_trajectories={max_trajectories}, max_samples={max_samples:,})"
+        )
+        data = minerl_data.make(env_id, data_dir=data_dir)
+        trajectories = list(data.get_trajectory_names())
+        if not trajectories:
+            raise RuntimeError("No MineRL trajectories found via minerl.data.make(...).")
+        random.shuffle(trajectories)
+
+        povs, invs, actions = [], [], []
+        for traj_i, traj_name in enumerate(trajectories[:max_trajectories], start=1):
+            step_count = 0
+            for obs, act, _r, _next_obs, _done in data.load_data(traj_name):
+                povs.append(preprocess_pov(obs["pov"]))
+                invs.append(obs_to_inventory_features(obs))
+                actions.append(map_demo_action_to_discrete(act))
+                step_count += 1
+
+                if len(actions) >= max_samples:
+                    break
+
+            print(f"[bc] Trajectory {traj_i:>3d}: {traj_name}  steps_used={step_count}")
+            if len(actions) >= max_samples:
+                break
+
+        if not actions:
+            raise RuntimeError("MineRL dataset iterator produced 0 samples.")
+
+        povs = np.asarray(povs, dtype=np.uint8)
+        invs = np.asarray(invs, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.int64)
+        print(f"[bc] Dataset ready: {len(actions):,} samples")
+        return povs, invs, actions
+    except Exception as exc:
+        print(f"[bc] Official minerl.data loader unavailable ({exc}). Trying fallback loader...")
+        return _build_imitation_dataset_from_recordings(
+            data_dir=data_dir,
+            max_trajectories=max_trajectories,
+            max_samples=max_samples,
+            seed=seed,
+        )
+
+
+def run_behavior_cloning(
+    agent,
+    povs: np.ndarray,
+    invs: np.ndarray,
+    actions: np.ndarray,
+    epochs: int = 5,
+    batch_size: int = 256,
+    lr: float = 1e-4,
+    val_frac: float = 0.05,
+):
+    """Pretrain actor with supervised behavior cloning from demonstrations."""
+    n = len(actions)
+    if n < 128:
+        raise RuntimeError(f"Not enough BC samples ({n}) to run imitation warm start.")
+
+    n_val = max(1, int(n * val_frac))
+    perm = np.random.permutation(n)
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+
+    train_ds = TensorDataset(
+        torch.as_tensor(povs[train_idx], dtype=torch.float32) / 255.0,
+        torch.as_tensor(invs[train_idx], dtype=torch.float32),
+        torch.as_tensor(actions[train_idx], dtype=torch.long),
+    )
+    val_ds = TensorDataset(
+        torch.as_tensor(povs[val_idx], dtype=torch.float32) / 255.0,
+        torch.as_tensor(invs[val_idx], dtype=torch.float32),
+        torch.as_tensor(actions[val_idx], dtype=torch.long),
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    optimizer = optim.Adam(agent.policy.parameters(), lr=lr, eps=1e-5)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+
+    best_val_loss = float("inf")
+    best_state = copy.deepcopy(agent.policy.state_dict())
+
+    print(
+        f"[bc] Starting BC for {epochs} epochs "
+        f"(train={len(train_idx):,}, val={len(val_idx):,}, batch={batch_size})"
+    )
+    for epoch in range(1, epochs + 1):
+        agent.policy.train()
+        running_loss = 0.0
+        running_correct = 0
+        running_total = 0
+
+        for pov_b, inv_b, act_b in train_loader:
+            pov_b = pov_b.to(agent.device)
+            inv_b = inv_b.to(agent.device)
+            act_b = act_b.to(agent.device)
+
+            logits, _ = agent.policy.forward(pov_b, inv_b)
+            loss = criterion(logits, act_b)
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.policy.parameters(), 1.0)
+            optimizer.step()
+
+            running_loss += float(loss.item()) * act_b.size(0)
+            preds = logits.argmax(dim=1)
+            running_correct += int((preds == act_b).sum().item())
+            running_total += int(act_b.size(0))
+
+        train_loss = running_loss / max(running_total, 1)
+        train_acc = running_correct / max(running_total, 1)
+
+        agent.policy.eval()
+        val_loss_sum = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for pov_b, inv_b, act_b in val_loader:
+                pov_b = pov_b.to(agent.device)
+                inv_b = inv_b.to(agent.device)
+                act_b = act_b.to(agent.device)
+                logits, _ = agent.policy.forward(pov_b, inv_b)
+                val_loss = criterion(logits, act_b)
+
+                val_loss_sum += float(val_loss.item()) * act_b.size(0)
+                val_correct += int((logits.argmax(dim=1) == act_b).sum().item())
+                val_total += int(act_b.size(0))
+
+        val_loss = val_loss_sum / max(val_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+        print(
+            f"[bc] epoch {epoch:>2d}/{epochs} | "
+            f"train_loss {train_loss:.4f} acc {train_acc:.3f} | "
+            f"val_loss {val_loss:.4f} acc {val_acc:.3f}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(agent.policy.state_dict())
+
+    agent.policy.load_state_dict(best_state)
+    print(f"[bc] Warm start complete. Best val_loss={best_val_loss:.4f}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -388,7 +863,7 @@ class PPOAgent:
         gamma:          float = 0.99,
         gae_lambda:     float = 0.95,
         clip_eps:       float = 0.2,
-        ent_coef:       float = 0.01,
+        ent_coef:       float = 0.05,
         vf_coef:        float = 0.5,
         max_grad_norm:  float = 0.5,
         n_epochs:       int   = 4,
@@ -404,6 +879,7 @@ class PPOAgent:
         self.n_epochs      = n_epochs
         self.minibatch_size = minibatch_size
         self.device        = device
+        self.lr            = lr
         self.policy    = PolicyNet(n_actions, n_inventory).to(device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, eps=1e-5)
 
@@ -514,6 +990,10 @@ class PPOAgent:
         if "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
 
+    def reset_optimizer(self, lr: float = None):
+        lr = self.lr if lr is None else lr
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, eps=1e-5)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5.  Training loop
@@ -523,20 +1003,24 @@ def train(
     total_timesteps: int = 500_000,
     rollout_steps:   int = 2048,
     save_dir:        str = "checkpoints",
-    save_every:      int = 50_000,
+    save_every:      int = 10_000,
     resume:          str = None,
+    imitation_warmstart: bool = False,
+    bc_only: bool = False,
+    bc_data_dir: str = None,
+    bc_trajectories: int = 40,
+    bc_samples: int = 120_000,
+    bc_epochs: int = 5,
+    bc_batch_size: int = 256,
+    bc_lr: float = 1e-4,
+    render_train: bool = False,
+    reset_max_retries: int = 5,
+    reset_retry_sleep: float = 5.0,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[train] device={device}  total_timesteps={total_timesteps:,}")
 
     os.makedirs(save_dir, exist_ok=True)
-
-    print("[train] Creating environment …")
-    env = make_env()
-    print("[train] Environment ready.")
-    print(f"        Action space   : {env.action_space}")
-    print(f"        Obs pov shape  : {env.observation_space['pov'].shape}")
-    print(f"        Obs inv shape  : {env.observation_space['inventory'].shape}")
 
     agent = PPOAgent(
         n_actions=N_ACTIONS,
@@ -555,11 +1039,51 @@ def train(
             pass
         print(f"[train] Resumed from {resume}  (step {start_step:,})")
 
+    elif imitation_warmstart:
+        povs, invs, actions = build_imitation_dataset(
+            env_id="MineRLObtainDiamondShovel-v0",
+            data_dir=bc_data_dir,
+            max_trajectories=bc_trajectories,
+            max_samples=bc_samples,
+        )
+        run_behavior_cloning(
+            agent,
+            povs,
+            invs,
+            actions,
+            epochs=bc_epochs,
+            batch_size=bc_batch_size,
+            lr=bc_lr,
+        )
+        bc_path = os.path.join(save_dir, "policy_bc_init.pth")
+        agent.save(bc_path)
+        print(f"[train] BC warm-start checkpoint saved → {bc_path}")
+
+        if bc_only:
+            print("[train] --bc-only set. Skipping PPO fine-tuning.")
+            return
+
+        # Reset PPO optimizer state after supervised pretraining.
+        agent.reset_optimizer()
+
+    print("[train] Creating environment …")
+    env = make_env()
+    print("[train] Environment ready.")
+    print(f"        Action space   : {env.action_space}")
+    print(f"        Obs pov shape  : {env.observation_space['pov'].shape}")
+    print(f"        Obs inv shape  : {env.observation_space['inventory'].shape}")
+
     print("[train] Calling env.reset() — world generation can take ~1 min …")
-    obs = env.reset()
+    obs, env = reset_env_with_retries(
+        env,
+        make_env,
+        max_retries=reset_max_retries,
+        retry_sleep=reset_retry_sleep,
+    )
     print("[train] env.reset() done.")
     ep_reward  = 0.0
     ep_count   = 0
+    ep_steps   = 0
     ep_rewards = deque(maxlen=20)
     timestep   = start_step
     next_save  = start_step + save_every
@@ -575,7 +1099,8 @@ def train(
         for _ in range(rollout_steps):
             action, log_prob, value = agent.select_action(obs)
             next_obs, reward, done, _ = env.step(action)
-            env.render()
+            if render_train:
+                env.render()
 
             rollout["povs"].append(obs["pov"])
             rollout["invs"].append(obs["inventory"])
@@ -586,6 +1111,7 @@ def train(
             rollout["dones"].append(float(done))
 
             ep_reward += reward
+            ep_steps  += 1
             obs        = next_obs
             timestep  += 1
 
@@ -593,7 +1119,24 @@ def train(
                 ep_rewards.append(ep_reward)
                 ep_count  += 1
                 ep_reward  = 0.0
-                obs        = env.reset()
+
+                if ep_steps <= 2:
+                    print("[train] Environment returned done instantly, likely crashed. Recreating...")
+                    try:
+                        env.close()
+                    except:
+                        pass
+                    time.sleep(3)
+                    env = make_env()
+
+                ep_steps = 0
+
+                obs, env = reset_env_with_retries(
+                    env,
+                    make_env,
+                    max_retries=reset_max_retries,
+                    retry_sleep=reset_retry_sleep,
+                )
 
         # ── PPO update ───────────────────────────────────────────────────────
         metrics = agent.update(rollout, obs)
@@ -678,7 +1221,29 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps",    type=int, default=500_000)
     parser.add_argument("--rollout-steps",type=int, default=2048)
     parser.add_argument("--save-dir",     type=str, default="checkpoints")
-    parser.add_argument("--save-every",   type=int, default=50_000)
+    parser.add_argument("--save-every",   type=int, default=10_000)
+    parser.add_argument("--imitation-warmstart", action="store_true",
+                        help="Pretrain policy with behavior cloning before PPO")
+    parser.add_argument("--bc-only", action="store_true",
+                        help="Run only behavior cloning and exit")
+    parser.add_argument("--bc-data-dir", type=str, default=None,
+                        help="Optional MineRL dataset directory for BC")
+    parser.add_argument("--bc-trajectories", type=int, default=40,
+                        help="Max demonstration trajectories used for BC")
+    parser.add_argument("--bc-samples", type=int, default=120_000,
+                        help="Max demonstration transitions used for BC")
+    parser.add_argument("--bc-epochs", type=int, default=5,
+                        help="Behavior cloning epochs")
+    parser.add_argument("--bc-batch-size", type=int, default=256,
+                        help="Behavior cloning batch size")
+    parser.add_argument("--bc-lr", type=float, default=1e-4,
+                        help="Behavior cloning learning rate")
+    parser.add_argument("--render-train", action="store_true",
+                        help="Render environment during PPO training")
+    parser.add_argument("--reset-max-retries", type=int, default=5,
+                        help="How many times to retry env.reset() before failing")
+    parser.add_argument("--reset-retry-sleep", type=float, default=5.0,
+                        help="Seconds to wait before recreating env after reset failure")
     parser.add_argument("--episodes",     type=int, default=5,
                         help="Number of eval episodes (--eval only)")
     args = parser.parse_args()
@@ -692,4 +1257,15 @@ if __name__ == "__main__":
             save_dir=args.save_dir,
             save_every=args.save_every,
             resume=args.resume,
+            imitation_warmstart=args.imitation_warmstart,
+            bc_only=args.bc_only,
+            bc_data_dir=args.bc_data_dir,
+            bc_trajectories=args.bc_trajectories,
+            bc_samples=args.bc_samples,
+            bc_epochs=args.bc_epochs,
+            bc_batch_size=args.bc_batch_size,
+            bc_lr=args.bc_lr,
+            render_train=args.render_train,
+            reset_max_retries=args.reset_max_retries,
+            reset_retry_sleep=args.reset_retry_sleep,
         )
