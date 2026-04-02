@@ -155,80 +155,38 @@ class PitchClampWrapper(gym.Wrapper):
 
 class AutoCraftWrapper(gym.Wrapper):
     """
-    Wraps MineRLObtainDiamondShovel-v0 to focus on the wood → crafting_table
-    sub-task.
-
-    Reads the real log count from obs['inventory'] each step (available because
-    MineRLObtainDiamondShovel-v0 uses FlatInventoryObservation(ALL_ITEMS)).
-    Replaces the env's sparse milestone rewards with dense per-log rewards and
-    ends the episode once the agent has collected enough logs to craft a table
-    (1 log → 4 planks → 1 crafting_table).
-
-    Rewards:
-      +1.0   per new log collected
-      +0.5   per new log (planks bonus)
-      +10.0  when virtual crafting_table is first obtained  (episode ends)
-      -5.0   when the agent dies (episode continues after respawn)
-      +0.03  each step the agent holds attack (sustained swing reward)
-      +0.05  each step the center of view shows wood-colored pixels
-      +0.08  when the tree fills a larger fraction of the view than last step
-             (approach reward, gated on a minimum increase threshold)
+    Clean reward shaping focused on actual progress:
+      - Strong reward for collecting logs
+      - Bonus for reaching crafting table
+      - Small penalties for useless mining / bad behavior
     """
 
-    PLANKS_REWARD   = 0.5
-    TABLE_REWARD    = 10.0
-    DEATH_REWARD    = -5.0
-    ATTACK_REWARD   = 0.0    # disabled — rewarded attacking dirt/ground (exploit)
-    LOOK_REWARD     = 0.05   # per step center-of-view shows wood
-    APPROACH_REWARD = 0.08   # when tree grows larger in view (agent moving closer)
-    APPROACH_THRESH = 0.02   # minimum fraction increase to count as approach
-    DOWNWARD_LOOK_PENALTY = -0.04  # per step when pitch > 45° (looking at ground)
+    LOG_REWARD        = 2.0    # strong signal
+    TABLE_REWARD      = 15.0   # goal reward
+    DEATH_PENALTY     = -5.0
+    USELESS_ATTACK    = -0.02
+    DOWNWARD_PENALTY  = -0.05
 
     MAX_CONSECUTIVE_RESETS = 5
 
     def __init__(self, env):
         super().__init__(env)
-        self._prev_logs           = 0
-        self._total_logs          = 0
-        self._virtual_planks      = 0
-        self._virtual_table       = False
-        self._was_alive           = True
-        self._prev_tree_frac      = 0.0
-        self._consecutive_resets  = 0
-        self._pitch               = 0.0   # estimated pitch in degrees (+= down)
+        self._prev_logs          = 0
+        self._total_logs         = 0
+        self._virtual_planks     = 0
+        self._virtual_table      = False
+        self._was_alive          = True
+        self._pitch              = 0.0
+        self._consecutive_resets = 0
 
     @staticmethod
     def _count_logs(obs) -> int:
+        LOG_TYPES = [
+            "oak_log", "spruce_log", "birch_log",
+            "jungle_log", "acacia_log", "dark_oak_log",
+        ]
         inv = obs.get("inventory", {})
         return sum(int(inv.get(t, 0)) for t in LOG_TYPES)
-
-    @staticmethod
-    def _tree_pixel_fraction(pov) -> float:
-        """Fraction of pixels that look like wood or leaves (HWC uint8)."""
-        r = pov[:, :, 0].astype(np.float32)
-        g = pov[:, :, 1].astype(np.float32)
-        b = pov[:, :, 2].astype(np.float32)
-        # Wood: warm brown — red-dominant, clearly not grey.
-        # Stricter than dirt: logs have higher R-G and R-B contrast.
-        # Dirt ~(134,96,67): r-g≈38, r-b≈67 → excluded by r-g>45 and r<120 guard.
-        is_wood = (r > g + 45) & (g > b + 5) & (r - b > 55) & (r > 80) & (r < 190)
-        # Leaves: green-dominant
-        is_leaf = (g > r + 5) & (g > b + 5) & (g > 55) & (r < 160) & (b < 140)
-        return float(np.mean(is_wood | is_leaf))
-
-    @staticmethod
-    def _looking_at_wood(pov) -> bool:
-        """True when the central 15 % of the view is mostly wood-coloured."""
-        h, w = pov.shape[:2]
-        mh, mw = max(1, h // 7), max(1, w // 7)
-        cy, cx = h // 2, w // 2
-        center = pov[cy - mh: cy + mh, cx - mw: cx + mw]
-        r = center[:, :, 0].astype(np.float32)
-        g = center[:, :, 1].astype(np.float32)
-        b = center[:, :, 2].astype(np.float32)
-        # Same stricter threshold as _tree_pixel_fraction to exclude dirt
-        is_wood = (r > g + 45) & (g > b + 5) & (r - b > 55) & (r > 80) & (r < 190)
-        return float(np.mean(is_wood)) > 0.25
 
     def _attach(self, obs):
         obs["_logs"]           = self._total_logs
@@ -243,99 +201,60 @@ class AutoCraftWrapper(gym.Wrapper):
         self._virtual_planks     = 0
         self._virtual_table      = False
         self._was_alive          = True
-        self._prev_tree_frac     = 0.0
-        self._consecutive_resets = 0
         self._pitch              = 0.0
+        self._consecutive_resets = 0
         return self._attach(obs)
 
     def step(self, action):
-        obs, _env_reward, done, info = self.env.step(action)
+        obs, _, done, info = self.env.step(action)
 
-        # Detect death: is_alive transitions True → False
+        reward = 0.0
+
+        # ── Death detection ─────────────────────────────
         is_alive = bool(obs.get("life_stats", {}).get("is_alive", True))
-        died = self._was_alive and not is_alive
+        if self._was_alive and not is_alive:
+            reward += self.DEATH_PENALTY
         self._was_alive = is_alive
 
-        # Count newly collected logs from inventory delta
+        # ── Log collection (MAIN SIGNAL) ────────────────
         curr_logs = self._count_logs(obs)
         new_logs  = max(0, curr_logs - self._prev_logs)
         self._prev_logs = curr_logs
 
-        # ── Primary log / table rewards ────────────────────────────────────
-        reward = float(new_logs)                                     # +1 per log
         if new_logs > 0:
+            reward += self.LOG_REWARD * new_logs
             self._total_logs     += new_logs
             self._virtual_planks += new_logs * 4
-            reward               += self.PLANKS_REWARD * new_logs   # +0.5 per log
 
-        if died:
-            reward += self.DEATH_REWARD
-
+        # ── Crafting table completion ───────────────────
         if not self._virtual_table and self._virtual_planks >= 4:
             self._virtual_table = True
             reward += self.TABLE_REWARD
-            done    = True
+            done = True
 
-        # ── Shaping: sustained attack ──────────────────────────────────────
-        if action.get("attack", 0):
-            reward += self.ATTACK_REWARD
+        # ── Penalize useless mining ─────────────────────
+        if action.get("attack", 0) and new_logs == 0:
+            reward += self.USELESS_ATTACK
 
-        # ── Shaping: penalise looking at ground ────────────────────────────
-        self._pitch += float(action.get("camera", [0.0, 0.0])[0])
-        if self._pitch > 45.0:
-            reward += self.DOWNWARD_LOOK_PENALTY
+        
 
-        # ── Shaping: visual tree signals ───────────────────────────────────
-        pov = obs.get("pov")
-        if pov is not None and pov.ndim == 3 and pov.shape[2] >= 3:
-            # Looking at wood (cross-hair on trunk)
-            if self._looking_at_wood(pov):
-                reward += self.LOOK_REWARD
-
-            # Approach reward: tree takes up more of view → agent moved closer
-            tree_frac = self._tree_pixel_fraction(pov)
-            if tree_frac > self._prev_tree_frac + self.APPROACH_THRESH:
-                reward += self.APPROACH_REWARD
-            self._prev_tree_frac = tree_frac
-
-        # If the underlying env ended the episode (death screen, time-limit, etc.)
-        # but the task isn't complete, respawn internally so the training loop
-        # never sees this as an episode boundary.  A consecutive-reset counter
-        # breaks any loop where the agent dies or times out immediately after
-        # each respawn — after MAX_CONSECUTIVE_RESETS we propagate done=True
-        # so the training loop can do a clean full reset.
+        # ── Handle env resets (same as before) ──────────
         if done and not self._virtual_table:
             self._consecutive_resets += 1
             if self._consecutive_resets <= self.MAX_CONSECUTIVE_RESETS:
-                # Run the internal reset on a background thread so a frozen
-                # Java process doesn't hang step() forever.
-                reset_result, reset_exc = [None], [None]
-                def _do_reset():
-                    try:
-                        reset_result[0] = self.env.reset()
-                    except Exception as e:
-                        reset_exc[0] = e
-                t = threading.Thread(target=_do_reset, daemon=True)
-                t.start()
-                t.join(timeout=180)
-                if t.is_alive() or reset_exc[0]:
-                    # Reset timed out or errored — propagate done=True so the
-                    # training loop can do a clean restart via _reset_with_timeout.
-                    print("[env] Internal reset timed out — propagating done=True")
-                else:
-                    obs = reset_result[0]
-                    self._prev_logs      = self._count_logs(obs)
-                    self._prev_tree_frac = 0.0
-                    self._was_alive      = True
+                try:
+                    obs = self.env.reset()
+                    self._prev_logs = self._count_logs(obs)
+                    self._was_alive = True
                     done = False
+                except:
+                    pass
             else:
-                print(f"[env] {self._consecutive_resets} consecutive resets — "
-                      "ending episode to allow full reset")
+                print("[env] Too many resets → ending episode")
         else:
             self._consecutive_resets = 0
 
         return self._attach(obs), reward, done, info
-
 
 class ObservationWrapper(gym.ObservationWrapper):
     """
@@ -417,7 +336,7 @@ class FixedSeedWrapper(gym.Wrapper):
         return self.env.reset()
 
 
-def _patch_jvm_memory(max_mem: str = "8G"):
+def _patch_jvm_memory(max_mem: str = "6G"):
     """
     Monkey-patch MinecraftInstance to use a larger JVM heap before gym.make().
     The default is 4G which leaks and freezes after thousands of steps.
@@ -429,7 +348,7 @@ def _patch_jvm_memory(max_mem: str = "8G"):
         def _patched(self, port=None, existing=False, status_dir=None,
                      seed=None, instance_id=None, max_mem=None):
             _orig(self, port=port, existing=existing, status_dir=status_dir,
-                  seed=seed, instance_id=instance_id, max_mem=max_mem or "8G")
+                  seed=seed, instance_id=instance_id, max_mem=max_mem or "6G")
         _malmo.MinecraftInstance.__init__ = _patched
         print(f"[make_env] JVM heap set to {max_mem}")
     except Exception as e:
@@ -437,7 +356,7 @@ def _patch_jvm_memory(max_mem: str = "8G"):
 
 
 def make_env():
-    _patch_jvm_memory("8G")
+    _patch_jvm_memory("6G")
     print("[make_env] Launching Minecraft Java process (can take 2–5 min on first run) …")
     env = gym.make("MineRLObtainDiamondShovel-v0")
     env.seed(WORLD_SEED)
@@ -621,7 +540,7 @@ class PPOAgent:
 # 5.  Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _reset_with_timeout(env, timeout_sec: int = 180):
+def _reset_with_timeout(env, timeout_sec: int = 360):
     """
     Call env.reset() on a background thread.  If it does not return within
     timeout_sec seconds (Java process frozen), raise TimeoutError so the
@@ -696,7 +615,7 @@ def train(
     timestep             = start_step
     next_save            = start_step + save_every
     resets_since_restart = 0
-    RESTART_EVERY        = 5   # recreate the Java process every N full resets
+    RESTART_EVERY        = 2   # recreate the Java process every N full resets
 
     rollout = {k: [] for k in
                ("povs", "invs", "actions", "log_probs", "rewards", "values", "dones")}
