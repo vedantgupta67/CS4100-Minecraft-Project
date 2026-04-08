@@ -3,3 +3,5 @@ venv/
 .java-version
 .vscode
 logs/
+.venv
+.DS_Store
