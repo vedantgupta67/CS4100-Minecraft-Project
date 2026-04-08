@@ -5,3 +5,5 @@ venv/
 logs/
 .venv
 .DS_Store
+scripts/foundation-model-*.weights
+scripts/foundation-model-*.model
