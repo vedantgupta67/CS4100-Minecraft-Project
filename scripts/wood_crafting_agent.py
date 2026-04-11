@@ -45,6 +45,11 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
+import logging
+logger = logging.getLogger(__name__)
+
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1.  Environment
@@ -417,6 +422,7 @@ class PPOAgent:
             freeze_cnn=True,
             device=device,
         )
+        print("DEBUG policy type:", type(self.policy))
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, eps=1e-5)
 
     # ------------------------------------------------------------------
@@ -897,10 +903,13 @@ def evaluate(
     print(f"[eval] device={device}")
     print(f"[eval] Loaded {checkpoint}")
 
+    # ───────────── Metrics ─────────────
+    successes = 0
+    times_to_first_log = []
+    steps_per_log = []
+
     ep = 0
     while ep < n_episodes:
-        # Recreate the env on each episode so a crashed Java process from the
-        # previous episode doesn't break subsequent ones.
         env = make_env()
         try:
             obs       = _reset_with_timeout(env)
@@ -908,21 +917,67 @@ def evaluate(
             done      = False
             steps     = 0
 
+            # metrics per episode
+            first_log_step = None
+            logs_at_start = float(obs["inventory"][0])
+            
             while not done:
                 with torch.no_grad():
                     action, _, _ = agent.select_action(obs, deterministic=True)
                 obs, reward, done, _ = env.step(action)
                 total_rew += reward
                 steps     += 1
+
+                # detect first log acquisition
+                logs = float(obs["inventory"][0])
+                if first_log_step is None and logs > 0:
+                    first_log_step = steps
+
                 env.render()
 
-            print(f"  Episode {ep + 1:2d}: reward={total_rew:.2f}  steps={steps}")
+            # ───────────── Episode end metrics ─────────────
+            logs = float(obs["inventory"][0])
+            crafted = float(obs["inventory"][2])
+            success = crafted > 0
+
+            if success:
+                successes += 1
+
+            if first_log_step is not None:
+                times_to_first_log.append(first_log_step)
+
+            # steps per log (avoid divide by zero)
+            log_gain = max(logs, 1e-8)
+            steps_per_log.append(steps / log_gain)
+
+            print(
+                f"  Episode {ep + 1:2d}: "
+                f"reward={total_rew:.2f}  steps={steps} "
+                f"logs={int(logs)} success={success}"
+            )
+
             ep += 1
+
         except Exception as e:
             print(f"  Episode {ep + 1:2d}: env error ({e}) — restarting Java process")
         finally:
             env.close()
 
+    # ───────────── Final summary ─────────────
+    success_rate = successes / max(ep, 1)
+
+    avg_time_to_log = (
+        np.mean(times_to_first_log) if times_to_first_log else float("inf")
+    )
+
+    avg_steps_per_log = (
+        np.mean(steps_per_log) if steps_per_log else float("inf")
+    )
+
+    print("\n===== Evaluation Results =====")
+    print(f"Success rate        : {success_rate * 100:.2f}%")
+    print(f"Avg time to 1st log : {avg_time_to_log:.1f} steps")
+    print(f"Avg steps per log   : {avg_steps_per_log:.1f}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7.  Entry point
