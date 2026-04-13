@@ -10,18 +10,39 @@ Architecture
 ------------
 - MineRLObtainDiamondShovel-v0 (survival world, has inventory obs, uses
     LowLevelInputsAgentStart required by MC 1.16.5) wrapped with:
-    * AutoCraftWrapper  — simulates crafting from reward signal, ends episode
-                          when crafting table is obtained
-    * DiscreteActionWrapper — 13 discrete actions over the Dict action space
+    * AutoCraftWrapper  — reward shaping for log collection + crafting
+    * DiscreteActionWrapper — 13 discrete actions (survival / gathering)
     * ObservationWrapper    — CHW image + virtual inventory vector
-- Discrete action wrapper (15 actions) over the Dict action space
+- Crafting env uses RecipeBookWrapper (6 discrete slot-jump actions):
+    * Agent opens inventory, clicks recipe book, selects recipe, collects result
+    * Cursor jumps directly to calibrated pixel positions — no incremental moves
 - Actor-Critic CNN + Inventory encoder (PolicyNet)
 - PPO with GAE for training
 
 Usage
 -----
-  python scripts/wood_crafting_agent.py            # train
-  python scripts/wood_crafting_agent.py --eval checkpoints/policy_final.pth
+  python scripts/wood_crafting_agent.py                                         # Defaults to wood gathering training
+  pypython scripts/wood_crafting_agent.py --env-mode crafting                   # Train crafting
+  python scripts/wood_crafting_agent.py --eval checkpoints/policy_final.pth     # Evaluate trained policy
+
+TensorBoard
+-----------
+  # TensorBoard logging is ON by default. To view while training:
+  #   Terminal 1 — start training:
+  python scripts/wood_crafting_agent.py
+
+  #   Terminal 2 — launch TensorBoard (logs go to <save-dir>/runs/ by default):
+  tensorboard --logdir checkpoints/runs/
+
+  # Then open http://localhost:6006 in your browser
+
+  # Optional TensorBoard flags:
+  #   --tensorboard-dir <path>    Override the log directory (default: tb_logs
+  #   --tb-flush-every <N>        Flush writer every N PPO updates (default: 10)
+  #   --tb-image-every <N>        Log a training frame every N completed episodes (default: 1)
+  #   --tb-video-every <N>        Log an eval video every N eval cycles (default: 3)
+  #   --tb-video-frames <N>       Max frames per logged eval video (default: 64)
+
 """
 
 import argparse
@@ -45,11 +66,6 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
-import logging
-logger = logging.getLogger(__name__)
-
-
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1.  Environment
@@ -72,7 +88,13 @@ LOG_TYPES = [
     "jungle_log", "acacia_log", "dark_oak_log",
 ]
 
-OBS_ITEMS = ["logs", "planks", "crafting_table"]   # names are only for reference
+PLANK_TYPES = [
+    "oak_planks", "spruce_planks", "birch_planks",
+    "jungle_planks", "acacia_planks", "dark_oak_planks",
+]
+
+# [logs, planks, crafting_table, gui_open] — all sourced from actual MC inventory
+OBS_ITEMS = ["logs", "planks", "crafting_table", "gui_open"]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.  Discrete-action wrapper
@@ -80,6 +102,7 @@ OBS_ITEMS = ["logs", "planks", "crafting_table"]   # names are only for referenc
 
 # Each entry is a dict of action-key -> value overrides on top of a no-op base.
 # 'camera' values are [pitch_delta, yaw_delta] in degrees.
+# ── Survival / wood-gathering policy actions ──────────────────────────────────
 DISCRETE_ACTIONS = [
     {},                                     # 0:  no-op
     {"forward": 1},                         # 1:  walk forward
@@ -99,12 +122,16 @@ N_ACTIONS = len(DISCRETE_ACTIONS)
 
 
 class DiscreteActionWrapper(gym.ActionWrapper):
-    """Maps integer action indices to MineRL Dict actions."""
+    """Maps integer action indices to MineRL Dict actions.
 
-    def __init__(self, env):
+    Defaults to DISCRETE_ACTIONS (survival / gathering policy).
+    """
+
+    def __init__(self, env, action_list=None):
         super().__init__(env)
+        self._actions = action_list if action_list is not None else DISCRETE_ACTIONS
         self._base = None
-        self.action_space = gym.spaces.Discrete(N_ACTIONS)
+        self.action_space = gym.spaces.Discrete(len(self._actions))
 
     def _get_base(self):
         if self._base is None:
@@ -113,7 +140,7 @@ class DiscreteActionWrapper(gym.ActionWrapper):
 
     def action(self, action_idx):
         act = dict(self._get_base())          # shallow copy
-        for key, val in DISCRETE_ACTIONS[int(action_idx)].items():
+        for key, val in self._actions[int(action_idx)].items():
             if key == "camera":
                 act["camera"] = np.array(val, dtype=np.float32)
             else:
@@ -164,99 +191,117 @@ class PitchClampWrapper(gym.Wrapper):
 
 class AutoCraftWrapper(gym.Wrapper):
     """
-    Clean reward shaping focused on actual progress:
-      - Strong reward for collecting logs
-      - Bonus for reaching crafting table
-      - Small penalties for useless mining / bad behavior
+    Reward shaping for collecting wood:
+      
+    Small positive reward for mining, decays over time
+        - This trains the agent to learn to mine for extended periods of time in order to mine long enough to gather a log
+          while also giving a negative reward for mining for too long to prevent teaching the agent to mine and do nothing else
+
+    Large reward for collecting a log
+
+    Small pentalty for dying
+
+    Pentalty for mining dirt to teach the agent what to mine
     """
 
-    LOG_REWARD        = 2.0    # strong signal
-    TABLE_REWARD      = 15.0   # goal reward
-    DEATH_PENALTY     = -5.0
-    USELESS_ATTACK    = -0.02
-    DOWNWARD_PENALTY  = -0.05
+    LOG_REWARD             = 1000.0   # per log collected
+    DEATH_PENALTY          =   -5.0
+    MINE_DIRT              =  -10.0
+    ATTACK_REWARD_INITIAL  =    0.01
+    ATTACK_REWARD_MIN      =   -0.05
+    ATTACK_DECAY_AMOUNT    =    0.001
 
     MAX_CONSECUTIVE_RESETS = 5
 
     def __init__(self, env):
         super().__init__(env)
-        self._prev_logs          = 0
-        self._total_logs         = 0
-        self._virtual_planks     = 0
-        self._virtual_table      = False
-        self._was_alive          = True
-        self._pitch              = 0.0
-        self._consecutive_resets = 0
+        self._prev_logs      = 0
+        self._prev_planks    = 0
+        self._prev_table     = 0
+        self._prev_dirt      = 0
+        self._total_logs     = 0
+        self._got_inv_bonus  = False
+        self._was_alive      = True
+        self._consecutive_resets      = 0
+        self._attack_reward_current   = self.ATTACK_REWARD_INITIAL
 
     @staticmethod
     def _count_logs(obs) -> int:
-        LOG_TYPES = [
-            "oak_log", "spruce_log", "birch_log",
-            "jungle_log", "acacia_log", "dark_oak_log",
-        ]
         inv = obs.get("inventory", {})
         return sum(int(inv.get(t, 0)) for t in LOG_TYPES)
 
+    @staticmethod
+    def _count_dirt(obs) -> int:
+        inv = obs.get("inventory", {})
+        return int(inv.get("dirt", 0))
+
     def _attach(self, obs):
-        obs["_logs"]           = self._total_logs
-        obs["_virtual_planks"] = self._virtual_planks
-        obs["_virtual_table"]  = int(self._virtual_table)
+        obs["_logs"]     = self._total_logs
+        obs["_planks"]   = self._count_planks(obs)
+        obs["_table"]    = self._count_table(obs)
+        obs["_gui_open"] = int(obs.get("isGuiOpen", 0))
         return obs
 
     def reset(self):
         obs = self.env.reset()
-        self._prev_logs          = self._count_logs(obs)
-        self._total_logs         = 0
-        self._virtual_planks     = 0
-        self._virtual_table      = False
-        self._was_alive          = True
-        self._pitch              = 0.0
-        self._consecutive_resets = 0
+        self._prev_logs               = self._count_logs(obs)
+        self._prev_planks             = self._count_planks(obs)
+        self._prev_table              = self._count_table(obs)
+        self._prev_dirt               = 0
+        self._total_logs              = 0
+        self._got_inv_bonus           = False
+        self._was_alive               = True
+        self._consecutive_resets      = 0
+        self._attack_reward_current   = self.ATTACK_REWARD_INITIAL
         return self._attach(obs)
 
     def step(self, action):
         obs, _, done, info = self.env.step(action)
-
         reward = 0.0
 
-        # ── Death detection ─────────────────────────────
+        # ── Death ──────────────────────────────────────────────────────────
         is_alive = bool(obs.get("life_stats", {}).get("is_alive", True))
         if self._was_alive and not is_alive:
             reward += self.DEATH_PENALTY
         self._was_alive = is_alive
 
-        # ── Log collection (MAIN SIGNAL) ────────────────
+        # ── Log collection ─────────────────────────────────────────────────
         curr_logs = self._count_logs(obs)
         new_logs  = max(0, curr_logs - self._prev_logs)
         self._prev_logs = curr_logs
-
         if new_logs > 0:
             reward += self.LOG_REWARD * new_logs
-            self._total_logs     += new_logs
-            self._virtual_planks += new_logs * 4
+            self._total_logs += new_logs
 
-        # ── Crafting table completion ───────────────────
-        if not self._virtual_table and self._virtual_planks >= 4:
-            self._virtual_table = True
-            reward += self.TABLE_REWARD
-            done = True
+        # ── Dirt penalty ───────────────────────────────────────────────────
+        curr_dirt = self._count_dirt(obs)
+        new_dirt  = max(0, curr_dirt - self._prev_dirt)
+        self._prev_dirt = curr_dirt
+        if new_dirt > 0:
+            reward += self.MINE_DIRT * new_dirt
 
-        # ── Penalize useless mining ─────────────────────
-        if action.get("attack", 0) and new_logs == 0:
-            reward += self.USELESS_ATTACK
+        # ── Attack decay (discourages fruitless mining) ────────────────────
+        if action.get("attack", 0):
+            reward += self._attack_reward_current
+            self._attack_reward_current = max(
+                self.ATTACK_REWARD_MIN,
+                self._attack_reward_current - self.ATTACK_DECAY_AMOUNT,
+            )
+        else:
+            self._attack_reward_current = self.ATTACK_REWARD_INITIAL
 
-        
-
-        # ── Handle env resets (same as before) ──────────
-        if done and not self._virtual_table:
+        # ── Episode-reset handling ─────────────────────────────────────────
+        if done and curr_logs == 0:   # done without success → try resetting
             self._consecutive_resets += 1
             if self._consecutive_resets <= self.MAX_CONSECUTIVE_RESETS:
                 try:
                     obs = self.env.reset()
-                    self._prev_logs = self._count_logs(obs)
-                    self._was_alive = True
+                    self._prev_logs   = self._count_logs(obs)
+                    self._prev_planks = self._count_planks(obs)
+                    self._prev_table  = self._count_table(obs)
+                    self._was_alive   = True
                     done = False
-                except:
+                except Exception:
                     pass
             else:
                 print("[env] Too many resets → ending episode")
@@ -269,7 +314,7 @@ class ObservationWrapper(gym.ObservationWrapper):
     """
     Converts the MineRL obs dict into:
       pov:       np.uint8  (3, 64, 64)  — CHW image, resized from 640×640
-      inventory: np.float32 (3,)        — [logs, virtual_planks, virtual_table]
+      inventory: np.float32 (4,)        — [logs, planks, crafting_table, gui_open]
     """
 
     POV_SIZE = 64  # target spatial resolution for the CNN
@@ -300,9 +345,10 @@ class ObservationWrapper(gym.ObservationWrapper):
         pov = (pov_t.squeeze(0) * 255).byte().numpy()   # (3, 64, 64) uint8
 
         inv = np.array([
-            float(obs.get("_logs",           0)),
-            float(obs.get("_virtual_planks", 0)),
-            float(obs.get("_virtual_table",  0)),
+            float(obs.get("_logs",     0)),   # logs collected this episode
+            float(obs.get("_planks",   0)),   # actual planks in inventory
+            float(obs.get("_table",    0)),   # actual crafting_table count
+            float(obs.get("_gui_open", 0)),   # 1 if inventory/GUI is open
         ], dtype=np.float32)
         return {"pov": pov, "inventory": inv}
 
@@ -327,6 +373,7 @@ class ActionRepeatWrapper(gym.Wrapper):
         total_reward = 0.0
         for _ in range(self._repeat):
             obs, reward, done, info = self.env.step(action)
+            self.env.render()
             total_reward += reward
             if done:
                 break
@@ -343,6 +390,180 @@ class FixedSeedWrapper(gym.Wrapper):
     def reset(self):
         self.env.seed(WORLD_SEED)
         return self.env.reset()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Crafting-specific wrappers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# GUI slot positions as camera-degree offsets from screen centre.
+# Values are (pitch_delta, yaw_delta) — the exact values to send as the
+# camera action from the centre position (where Minecraft places the cursor
+# when the inventory opens).  No pixel-conversion factor needed.
+SLOTS = {
+    "recipe_book_btn": (-2, 4),   # (pitch, yaw) — green book icon
+    "recipe_planks":   (-6, -20),   # (pitch, yaw) — planks recipe entry
+    "recipe_table":    (-6, -12),   # (pitch, yaw) — crafting table entry
+    "output_slot":     (-6, 23),   # (pitch, yaw) — output slot
+    "inv_slot":        (0, 0),   # (pitch, yaw) — first inventory slot
+}
+
+N_RECIPE_ACTIONS = 6
+
+
+class RecipeBookWrapper(gym.Wrapper):
+    """
+    Discrete crafting via the recipe book.
+
+    The inventory is opened once at the start of each episode and stays pinned
+    open — the agent has no way to close it.
+
+    Action space (N_RECIPE_ACTIONS = 6):
+      0  no-op
+      1  click recipe book button
+      2  click 'planks' recipe
+      3  click 'crafting table' recipe
+      4  click output slot (collect result)
+      5  click first inventory slot (deposit held item)
+
+    Click actions are wrapped to be one action with buttons. The agent will move to a button and then click it.
+    The agent sees a single step for each. 
+
+    Cursor position is tracked in camera-degree space from screen centre,
+    which is where Minecraft places the cursor when the inventory opens.
+
+    Reward:
+      +PLANK_REWARD  per plank that appears in inventory
+      +TABLE_REWARD  crafting table obtained → ends episode
+    """
+
+    PLANK_REWARD = 500.0
+    TABLE_REWARD = 10_000.0
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._cam_pitch = 0.0   
+        self._cam_yaw   = 0.0
+        self._planks_rewarded = False
+        self._table_rewarded  = False
+        self.action_space  = gym.spaces.Discrete(N_RECIPE_ACTIONS)
+
+    @staticmethod
+    def _count_planks(obs):
+        inv = obs.get("inventory", {})
+        return sum(int(inv.get(t, 0)) for t in PLANK_TYPES)
+
+    @staticmethod
+    def _count_table(obs):
+        inv = obs.get("inventory", {})
+        return int(inv.get("crafting_table", 0))
+
+    @staticmethod
+    def _count_logs(obs):
+        inv = obs.get("inventory", {})
+        return sum(int(inv.get(t, 0)) for t in LOG_TYPES)
+
+    def _attach(self, obs):
+        obs["_logs"]     = self._count_logs(obs)
+        obs["_planks"]   = self._count_planks(obs)
+        obs["_table"]    = self._count_table(obs)
+        obs["_gui_open"] = 1
+        return obs
+
+    def reset(self):
+        obs = self.env.reset()
+        # Open the inventory and leave it pinned — no toggle action exists.
+        open_act = self.env.action_space.no_op()
+        open_act["inventory"] = 1
+        obs, _, _, _ = self.env.step(open_act)
+        # Minecraft resets cursor to screen centre on GUI open → degrees = 0
+        self._cam_pitch = 0.0
+        self._cam_yaw   = 0.0
+        self._planks_rewarded = False
+        self._table_rewarded  = False
+        return self._attach(obs)
+
+    _warned_uncalibrated = False
+
+    def _warp_and_click(self, target_pitch, target_yaw):
+        """Move cursor to (target_pitch, target_yaw) degrees from centre, then left-click."""
+        noop = self.env.action_space.no_op()
+        if target_pitch is None or target_yaw is None:
+            if not RecipeBookWrapper._warned_uncalibrated:
+                print("[RecipeBookWrapper] SLOTS not calibrated — click actions are no-ops. "
+                      "Run scripts/calibrate_gui.py to find the correct values.")
+                RecipeBookWrapper._warned_uncalibrated = True
+            obs, r, done, info = self.env.step(noop)
+            return obs, r, done, info
+
+        delta_pitch = target_pitch - self._cam_pitch
+        delta_yaw   = target_yaw   - self._cam_yaw
+        move_act = dict(noop)
+        move_act["camera"] = np.array([delta_pitch, delta_yaw], dtype=np.float32)
+        obs, r1, done, info = self.env.step(move_act)
+        self._cam_pitch = target_pitch
+        self._cam_yaw   = target_yaw
+        if done:
+            return obs, r1, done, info
+
+        time.sleep(0.5)   # give Minecraft time to process
+        click_act = dict(noop)
+        click_act["attack"] = 1
+        obs, r2, done, info = self.env.step(click_act)
+        return obs, r1 + r2, done, info
+
+    def step(self, action):
+        noop = self.env.action_space.no_op()
+
+        if action == 0:
+            obs, r, done, info = self.env.step(noop)
+        elif action == 1:
+            obs, r, done, info = self._warp_and_click(*SLOTS["recipe_book_btn"])
+        elif action == 2:
+            obs, r, done, info = self._warp_and_click(*SLOTS["recipe_planks"])
+        elif action == 3:
+            obs, r, done, info = self._warp_and_click(*SLOTS["recipe_table"])
+        elif action == 4:
+            obs, r, done, info = self._warp_and_click(*SLOTS["output_slot"])
+        elif action == 5:
+            obs, r, done, info = self._warp_and_click(*SLOTS["inv_slot"])
+        else:
+            obs, r, done, info = self.env.step(noop)
+
+        time.sleep(1)   # give minecraft time to process
+
+        reward = 0.0
+
+        if not self._planks_rewarded and self._count_planks(obs) > 0:
+            reward += self.PLANK_REWARD
+            self._planks_rewarded = True
+
+        if not self._table_rewarded and self._count_table(obs) > 0:
+            reward += self.TABLE_REWARD
+            self._table_rewarded = True
+            done = True
+
+        return self._attach(obs), reward, done, info
+
+
+class MaxStepsWrapper(gym.Wrapper):
+    """Terminates the episode after ``max_steps`` agent steps."""
+
+    def __init__(self, env, max_steps: int):
+        super().__init__(env)
+        self._max_steps = max_steps
+        self._steps = 0
+
+    def reset(self):
+        self._steps = 0
+        return self.env.reset()
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        self._steps += 1
+        if self._steps >= self._max_steps:
+            done = True
+        return obs, reward, done, info
 
 
 def _patch_jvm_memory(max_mem: str = "6G"):
@@ -365,6 +586,7 @@ def _patch_jvm_memory(max_mem: str = "6G"):
 
 
 def make_env():
+    """Survival env — agent must chop logs AND craft the table from scratch."""
     _patch_jvm_memory("6G")
     print("[make_env] Launching Minecraft Java process (can take 2–5 min on first run) …")
     env = gym.make("MineRLObtainDiamondShovel-v0")
@@ -375,6 +597,57 @@ def make_env():
     env = PitchClampWrapper(env)
     env = DiscreteActionWrapper(env)
     env = ActionRepeatWrapper(env, repeat=4)
+    env = ObservationWrapper(env)
+    return env
+
+
+def make_crafting_env():
+    """
+    Crafting-only env — trains the crafting policy in isolation.
+
+    Episode setup
+    -------------
+    - Agent spawns with 1 oak_log pre-loaded in slot 0 (InventoryAgentStart).
+    - RecipeBookWrapper exposes 6 discrete actions: no-op, toggle inventory,
+      click recipe book, click planks recipe, click crafting table recipe,
+      click output slot.  Calibrate SLOTS before training.
+
+    Action space (N_RECIPE_ACTIONS = 6)
+    ------------------------------------
+    Discrete slot-jump actions — the cursor warps directly to the target
+    position in one tick then clicks.  No incremental camera movement.
+
+    Reward
+    ------
+    RecipeBookWrapper: +500 per plank gained, +10 000 for crafting table.
+
+    ----------------------------
+    base → FixedSeed → RecipeBook → MaxSteps → Obs
+    """
+    from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
+    from minerl.herobraine.hero.handlers.agent.start import InventoryAgentStart
+    from minerl.env._singleagent import _SingleAgentEnv
+
+    class CraftingEnvSpec(HumanSurvival):
+        def __init__(self):
+            super().__init__(name="CraftingTask-v0", max_episode_steps=2400)
+
+        def create_agent_start(self):
+            handlers = super().create_agent_start()
+            handlers.append(InventoryAgentStart({
+                0: {"type": "oak_log", "quantity": 1}
+            }))
+            return handlers
+
+    _patch_jvm_memory("6G")
+    print("[make_crafting_env] Launching Minecraft Java process …")
+    spec = CraftingEnvSpec()
+    env = _SingleAgentEnv(env_spec=spec)
+    env.seed(WORLD_SEED)
+    print("[make_crafting_env] env created — wrapping …")
+    env = FixedSeedWrapper(env)
+    env = RecipeBookWrapper(env)
+    env = MaxStepsWrapper(env, max_steps=8000)
     env = ObservationWrapper(env)
     return env
 
@@ -422,7 +695,6 @@ class PPOAgent:
             freeze_cnn=True,
             device=device,
         )
-        print("DEBUG policy type:", type(self.policy))
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, eps=1e-5)
 
     # ------------------------------------------------------------------
@@ -587,6 +859,7 @@ def _evaluate_policy(
     max_steps: int,
     video_frames: int,
     capture_video: bool,
+    env_mode: str = "crafting",
 ):
     if n_episodes <= 0:
         return {
@@ -603,8 +876,9 @@ def _evaluate_policy(
     sample_frame = None
     captured_frames = []
 
+    _env_factory = make_crafting_env if env_mode == "crafting" else make_env
     for ep in range(n_episodes):
-        env = make_env()
+        env = _env_factory()
         try:
             obs = _reset_with_timeout(env)
             total_rew = 0.0
@@ -618,7 +892,7 @@ def _evaluate_policy(
                 total_rew += reward
                 steps += 1
 
-                crafted = crafted or bool(obs["inventory"][2] >= 1.0)
+                crafted = crafted or bool(obs["inventory"][2] >= 1.0)  # crafting_table slot
 
                 if sample_frame is None and "pov" in obs:
                     sample_frame = obs["pov"]
@@ -669,6 +943,7 @@ def train(
     eval_episodes:   int = 2,
     eval_max_steps:  int = 800,
     no_tensorboard:  bool = False,
+    env_mode:        str = "crafting",
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[train] device={device}  total_timesteps={total_timesteps:,}")
@@ -699,15 +974,17 @@ def train(
     else:
         print("[train] TensorBoard disabled via --no-tensorboard")
 
-    print("[train] Creating environment …")
-    env = make_env()
+    _env_factory = make_crafting_env if env_mode == "crafting" else make_env
+    _n_actions   = N_RECIPE_ACTIONS if env_mode == "crafting" else N_ACTIONS
+    print(f"[train] Creating environment (mode={env_mode}, n_actions={_n_actions}) …")
+    env = _env_factory()
     print("[train] Environment ready.")
     print(f"        Action space   : {env.action_space}")
     print(f"        Obs pov shape  : {env.observation_space['pov'].shape}")
     print(f"        Obs inv shape  : {env.observation_space['inventory'].shape}")
 
     agent = PPOAgent(
-        n_actions=N_ACTIONS,
+        n_actions=_n_actions,
         n_inventory=len(OBS_ITEMS),
         vpt_model=vpt_model,
         vpt_weights=vpt_weights,
@@ -750,7 +1027,14 @@ def train(
             # ── Collect one rollout ──────────────────────────────────────────
             for _ in range(rollout_steps):
                 action, log_prob, value = agent.select_action(obs)
-                next_obs, reward, done, _ = env.step(action)
+                next_obs, reward, done, info = env.step(action)
+
+                # MineRL signals a step-level timeout via info['error']; treat
+                # it as a forced episode end so we reset rather than continuing
+                # to step a broken env.
+                if "error" in info:
+                    print(f"[train] Step error from env: {info['error']}")
+                    done = True
 
                 rollout["povs"].append(obs["pov"])
                 rollout["invs"].append(obs["inventory"])
@@ -789,10 +1073,21 @@ def train(
                     if resets_since_restart >= RESTART_EVERY:
                         print("[train] Restarting Java process to clear JVM heap …")
                         env.close()
-                        env = make_env()
+                        env = _env_factory()
                         resets_since_restart = 0
 
-                    obs = _reset_with_timeout(env)
+                    try:
+                        obs = _reset_with_timeout(env)
+                    except TimeoutError:
+                        print("[train] Reset timed out — Java process frozen. "
+                              "Recreating env and continuing…")
+                        try:
+                            env.close()
+                        except Exception:
+                            pass
+                        env = _env_factory()
+                        resets_since_restart = 0
+                        obs = _reset_with_timeout(env)
 
             # ── PPO update ───────────────────────────────────────────────────
             metrics = agent.update(rollout, obs)
@@ -834,6 +1129,7 @@ def train(
                     max_steps=eval_max_steps,
                     video_frames=tb_video_frames,
                     capture_video=(writer is not None and tb_video_every > 0 and eval_idx % tb_video_every == 0),
+                    env_mode=env_mode,
                 )
                 print(
                     f"[eval] mean_reward={eval_out['mean_reward']:.2f} "
@@ -979,6 +1275,7 @@ def evaluate(
     print(f"Avg time to 1st log : {avg_time_to_log:.1f} steps")
     print(f"Avg steps per log   : {avg_steps_per_log:.1f}")
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 7.  Entry point
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1009,7 +1306,7 @@ if __name__ == "__main__":
                         help="Path to VPT .weights file")
     parser.add_argument("--print-rewards", action="store_true",
                         help="Print reward at every step during training")
-    parser.add_argument("--tensorboard-dir", type=str, default=None,
+    parser.add_argument("--tensorboard-dir", type=str, default="tb_logs",
                         help="Directory for TensorBoard event files (default: <save-dir>/runs)")
     parser.add_argument("--tb-flush-every", type=int, default=10,
                         help="Flush TensorBoard writer every N PPO updates")
@@ -1027,11 +1324,20 @@ if __name__ == "__main__":
                         help="Maximum steps per periodic eval episode")
     parser.add_argument("--no-tensorboard", action="store_true",
                         help="Disable TensorBoard logging during training")
+    parser.add_argument(
+        "--env-mode", type=str, default="survival",
+        choices=["crafting", "survival"],
+        help=(
+            "crafting: start each episode with 1 oak_log, train inventory GUI crafting. "
+            "survival: standard survival world, agent must chop and craft from scratch."
+        ),
+    )
     args = parser.parse_args()
 
     if args.eval:
         evaluate(args.eval, n_episodes=args.episodes,
-                 vpt_model=args.vpt_model, vpt_weights=args.vpt_weights)
+                 vpt_model=args.vpt_model, vpt_weights=args.vpt_weights,
+                 env_mode=args.env_mode)
     else:
         train(
             total_timesteps=args.timesteps,
@@ -1051,4 +1357,5 @@ if __name__ == "__main__":
             eval_episodes=args.eval_episodes,
             eval_max_steps=args.eval_max_steps,
             no_tensorboard=args.no_tensorboard,
+            env_mode=args.env_mode,
         )
