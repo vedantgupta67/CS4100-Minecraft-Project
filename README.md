@@ -1,108 +1,227 @@
 # CS4100-Minecraft-Project
 
+This project trains and evaluates Minecraft RL policies for:
 
-# Installation requirements for MineRL
+1. Gathering wood in survival mode
+2. Crafting planks and a crafting table using inventory GUI actions
+3. Running a full pipeline evaluation (wood policy -> craft policy in same world)
 
+## Installation Requirements for MineRL
 
-need to clone minerl into minerl folder:
+### 1. Clone MineRL into this repository
 
+```bash
 git clone https://github.com/minerllabs/minerl.git minerl
+```
 
-python 3.10:
+### 2. Python 3.10
 
-run:
-
+```bash
 brew install python@3.10
-
 python3.10 -m venv venv
-
 source venv/bin/activate
+python --version
+```
 
-confirm with: python --version
+Expected: `python --version` shows `3.10.x`.
 
+### 3. Java 8
 
-java 8
-
-run:
-
+```bash
 brew install --cask temurin@8
-
 export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home
+java --version
+```
 
-confirm with: java --version
+Expected: Java 8 / Temurin 8 output.
 
+### 4. Install Python dependencies
 
-Then from home directory run:
+From the project root:
+
+```bash
 pip install setuptools==65.5.0
 pip install gym==0.23.1
+pip install -r requirements.txt
 pip install -e minerl/
+```
 
-confirm installation with: pip list
+MineRL install can take up to ~30 minutes.
 
+### 5. Verify installation
+
+```bash
+python -c "import gym, minerl, torch; print('imports ok')"
+pip list | grep -E "minerl|torch|gym"
+```
 
 ## Windows Specific
-Install WSL Ubuntu version >22 and Temurin Java 8 onto it
 
-Should be able to run code after that!
+Use WSL (Ubuntu 22+ recommended), install Java 8 and Python 3.10 in WSL, then follow the same steps above.
 
+## VPT Model Files
 
-## Installing MineRL
-MineRL can take up to 30 minutes when installing, stay patient.
+The training/evaluation scripts require VPT model files.
 
-## VPT Model
-To run the wood_crafting_agent.py file:
-
+```bash
 git clone https://github.com/openai/Video-Pre-Training.git
+```
 
-From https://github.com/openai/Video-Pre-Training
+Download `foundation-model-1x.model` and `foundation-model-1x.weights` from the VPT releases and place both into `scripts/`.
 
-Download 1x Model and 1x Width Weights from their README.md
+Defaults used by scripts:
 
-Place those files into /scripts
+```text
+./scripts/foundation-model-1x.model
+./scripts/foundation-model-1x.weights
+```
 
-By default wood_crafting_agent.py uses those files, if you want to specify a different path use the flags `--vpt-model {path}` and `--vpt-weights {path}`
+Override with:
 
-You can use different the 2x or 3x model and width weights, however, those are much larger and slower, but can produce better results than the 1x.
+```text
+--vpt-model PATH_TO_MODEL --vpt-weights PATH_TO_WEIGHTS
+```
 
-## Running the Agent
+## Running
 
-To run the agent: `python ./scripts/wood_crafting_agent.py`
+### A. Train Wood Gathering Policy (default)
 
-The start up on the agent can take 2-5 minutes and by default, it will not render the environment. You can tell that the agent is running in the terminal if you see `[train] Starting collection …`. After some time, the stats will begin printing for each rollout of steps.
+```bash
+python ./scripts/wood_crafting_agent.py
+```
 
-There is a known issue that the environment will freeze after some time, at that point, the program will try to restart the environment and continue the training. If you see multiple `[env] 6 consecutive resets — ending episode to allow full reset`, the program is attempting a restart.
+### B. Train Crafting Policy (GUI crafting mode)
 
-If a training session is interrupted, the training data will be automatically saved to the checkpoints folder.
+```bash
+python ./scripts/wood_crafting_agent.py --env-mode crafting
+```
 
-## Checkpoints
+### C. Resume training from checkpoint
 
-By default, wood_crafting_agent.py saves a .pth file to the /checkpoints folder every 50,000 steps
+```bash
+python ./scripts/wood_crafting_agent.py --resume checkpoints/policy_162312.pth
+```
 
-To change the save directory for checkpoints: `--save-dir {directory name}` (default: checkpoints)
+### D. Evaluate one checkpoint
 
-You can change this using the `--save-every {# of steps}` flag
+```bash
+python ./scripts/wood_crafting_agent.py --eval checkpoints/policy_162312.pth --episodes 5
+```
 
-To run a checkpoint, use the `--resume {path}` flag
+### E. Full pipeline evaluation (wood -> craft)
 
-To evaluate a checkpoint, use the `--eval {path}` flag
+```bash
+python ./scripts/evaluate_full_run.py \
+      --wood-policy checkpoints/policy_162312.pth \
+      --craft-policy checkpoints/policy_31560.pth \
+      --episodes 3
+```
 
-## Other Useful Arguments
+Optional: add `--render` to visualize the world.
 
-To change the total number of timesteps: `--timesteps {# of timesteps}`(default: 500,000)
+## GUI Calibration (needed for crafting mode)
 
-To change the rollout of stats: `--rollout-steps {# of rollout-steps}` (default: 2048)
+Crafting clicks use calibrated camera offsets stored in `SLOTS`.
 
-To number of episodes: `--episodes {# of episodes}` (default: 5)
+Phase 1:
 
-To print the rewards gained or lost at every step: `--print-rewards` (default: false)
+```bash
+python ./scripts/calibrate_gui.py
+```
 
-## Current Reward System
-      +0.5   per new log
-      +10.0  when virtual crafting_table is first obtained  (episode ends)
-      -5.0   when the agent dies (episode continues after respawn)
-      +0.05  each step the center of view shows wood-colored pixels
-      +0.08  when the tree fills a larger fraction of the view than last step
-             (approach reward, gated on a minimum increase threshold)
+Phase 2:
+
+```bash
+python ./scripts/calibrate_gui.py --phase 2 --btn-pitch P --btn-yaw Y
+```
+
+Phase 3:
+
+```bash
+python ./scripts/calibrate_gui.py --phase 3 \
+      --btn-pitch P1 --btn-yaw Y1 \
+      --planks-pitch P2 --planks-yaw Y2 \
+      --output-pitch P3 --output-yaw Y3 \
+      --inv-pitch P4 --inv-yaw Y4
+```
+
+After calibration, update slot values in `scripts/shared_runtime.py`.
+
+## Checkpoints and Logging
+
+- Default checkpoint directory: `checkpoints/`
+- Default save frequency: every `50,000` steps
+- Default rollout steps: `2048`
+- TensorBoard is ON by default (disable with `--no-tensorboard`)
+- TensorBoard logs are written under `<save-dir>/runs/`
+
+Start TensorBoard:
+
+```bash
+tensorboard --logdir checkpoints/runs
+```
+
+## Common Useful Flags
+
+Training (`wood_crafting_agent.py`):
+
+- `--timesteps` (default `500000`)
+- `--rollout-steps` (default `2048`)
+- `--save-dir` / `--save-every`
+- `--eval-every`, `--eval-episodes`, `--eval-max-steps`
+- `--print-rewards`
+- `--env-mode {survival,crafting}`
+
+Full pipeline eval (`evaluate_full_run.py`):
+
+- `--episodes` (default `3`)
+- `--max-wood-steps` (default `3000`)
+- `--max-craft-steps` (default `500`)
+- `--render`
+
+Block identification data collection (`block_identification_train.py`):
+
+- `--episodes` (default `1`)
+- `--max-steps` (default `50000`)
+- `--skip-empty` (skip `far_away` labels)
+
+## Runtime Notes and Troubleshooting
+
+- Startup can take 2-5 minutes when launching Minecraft.
+- If you see repeated reset messages, the script is attempting JVM/environment recovery.
+- If training is interrupted, resume with `--resume` using the latest checkpoint.
+- If VPT files are missing, pass explicit paths using `--vpt-model` and `--vpt-weights`.
+
+## Block Identification Scripts
+
+Location: `scripts/block_identification/`
+
+Primary scripts:
+
+- `block_identification_train.py`: canonical collector for KNN block labels.
+- `block_identification_train_no_empty.py`: compatibility wrapper that runs canonical collector with empty-label saving disabled.
+- `evaluate_block_identification.py`: basic KNN-driven online evaluation.
+- `log_training.py`: log-focused dataset expansion and mining loop.
+- `evaluate_log_db.py`: log-seeking evaluator using nearest-neighbor diff minimization.
+
+Data artifacts are saved in `scripts/block_identification/` with deterministic paths:
+
+- `block_observations_2.npz`
+- `block_labels_2.json`
+- `knn_model.joblib`
+- `log_observations.npz`
+- `log_labels.json`
+
+## Current Reward System (wood and crafting wrappers)
+
+- Wood policy shaping:
+      - `+1000.0` per new log
+      - `-10.0` per new dirt mined
+      - `-5.0` on death
+      - attack decay reward starts at `+0.01`, decays to `-0.05`
+- Crafting wrapper shaping:
+      - `+500.0` when planks are first obtained
+      - `+10000.0` when crafting table is obtained (episode ends)
 
 ## PPO — How the Agent Learns
 

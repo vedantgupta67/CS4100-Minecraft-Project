@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import gym
@@ -35,7 +36,7 @@ import minerl
 
 sys.path.insert(0, os.path.dirname(__file__))
 from KNN_model import KNN, pov_difference
-from block_identification_train_no_empty import (
+from block_identification_train import (
     ENV_NAME,
     noop,
     attack_action,
@@ -47,9 +48,9 @@ from block_identification_train_no_empty import (
 )
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-ROOT              = os.path.join(os.path.dirname(__file__), "..", "..")
-LOG_OBS_PATH      = os.path.join(ROOT, "log_observations.npz")
-LOG_LBL_PATH      = os.path.join(ROOT, "log_labels.json")
+BASE_DIR = Path(__file__).resolve().parent
+LOG_OBS_PATH = BASE_DIR / "log_observations.npz"
+LOG_LBL_PATH = BASE_DIR / "log_labels.json"
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 MINE_THRESH       = 0.05   # mine when nearest-log diff falls below this

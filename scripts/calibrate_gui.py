@@ -62,7 +62,7 @@ except ImportError:
 
 import gym
 import minerl
-from wood_crafting_agent import _patch_jvm_memory, WORLD_SEED
+from shared_runtime import WORLD_SEED, patch_jvm_memory
 from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
 from minerl.herobraine.hero.handlers.agent.start import InventoryAgentStart
 from minerl.env._singleagent import _SingleAgentEnv
@@ -82,7 +82,7 @@ class CraftingEnvSpec(HumanSurvival):
 
 
 def _make_env():
-    _patch_jvm_memory("6G")
+    patch_jvm_memory("6G")
     print("Launching Minecraft…")
     spec = CraftingEnvSpec()
     env  = _SingleAgentEnv(env_spec=spec)

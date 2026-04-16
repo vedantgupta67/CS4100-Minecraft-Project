@@ -7,3 +7,4 @@ logs/
 .DS_Store
 scripts/foundation-model-*.weights
 scripts/foundation-model-*.model
+scripts/block_identification/STOP_REQUESTED

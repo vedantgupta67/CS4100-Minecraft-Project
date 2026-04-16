@@ -1,14 +1,13 @@
 import os
 import time
 import json
+from pathlib import Path
 import numpy as np
 import gym
 import minerl
 from KNN_model import KNN, pov_difference
-from block_identification_train_no_empty import (
+from block_identification_train import (
     ENV_NAME,
-    POV_DB_PATH,
-    LABEL_DB_PATH,
     random_wander_action,
     attack_action,
     walk_forward_action,
@@ -23,16 +22,18 @@ MINE_DURATION   = 10.0  # seconds to mine once a log is spotted
 PICKUP_STEPS    = 50    # steps to walk forward after mining
 LOG_DIFF_THRESH = 0.05  # mine if nearest log POV diff is below this
 
-LOG_POV_DB_PATH   = "log_observations.npz"
-LOG_LABEL_DB_PATH = "log_labels.json"
+BASE_DIR = Path(__file__).resolve().parent
+LOG_POV_DB_PATH = BASE_DIR / "log_observations.npz"
+LOG_LABEL_DB_PATH = BASE_DIR / "log_labels.json"
+STOP_FLAG = BASE_DIR / "STOP_REQUESTED"
 
 
 # ── Log dataset helpers ────────────────────────────────────────────
 
 def load_log_db() -> tuple[np.ndarray | None, list[str]]:
-    if os.path.exists(LOG_POV_DB_PATH) and os.path.exists(LOG_LABEL_DB_PATH):
+    if LOG_POV_DB_PATH.exists() and LOG_LABEL_DB_PATH.exists():
         povs = np.load(LOG_POV_DB_PATH)["povs"]
-        with open(LOG_LABEL_DB_PATH) as f:
+        with LOG_LABEL_DB_PATH.open() as f:
             labels = json.load(f)
         print(f"[LOG-DB] Loaded {len(labels)} existing log observations")
         return povs, labels
@@ -41,7 +42,7 @@ def load_log_db() -> tuple[np.ndarray | None, list[str]]:
 
 def save_log_db(povs: np.ndarray, labels: list[str]):
     np.savez_compressed(LOG_POV_DB_PATH, povs=povs)
-    with open(LOG_LABEL_DB_PATH, "w") as f:
+    with LOG_LABEL_DB_PATH.open("w") as f:
         json.dump(labels, f)
 
 
@@ -61,21 +62,6 @@ def load_all_log_povs() -> tuple[np.ndarray, list[str]]:
     Merge the dedicated log DB with any log-labelled rows from the main DB.
     """
     all_povs, all_labels = load_log_db()
-
-    # if os.path.exists(POV_DB_PATH) and os.path.exists(LABEL_DB_PATH):
-    #     main_povs = np.load(POV_DB_PATH)["povs"]
-    #     with open(LABEL_DB_PATH) as f:
-    #         main_labels = json.load(f)
-    #     log_idx = [i for i, lbl in enumerate(main_labels) if "log" in lbl.lower()]
-    #     if log_idx:
-    #         extra_povs   = main_povs[log_idx]
-    #         extra_labels = [main_labels[i] for i in log_idx]
-    #         print(f"[LOG-DB] Pulling {len(log_idx)} log rows from main DB")
-    #         if all_povs is None:
-    #             all_povs, all_labels = extra_povs, extra_labels
-    #         else:
-    #             all_povs   = np.concatenate([all_povs, extra_povs], axis=0)
-    #             all_labels = all_labels + extra_labels
 
     if all_povs is None or len(all_labels) == 0:
         raise RuntimeError("No log observations found — collect some log data first.")
@@ -99,9 +85,6 @@ def has_log(obs: dict) -> bool:
 
 # ── Main loop ──────────────────────────────────────────────────────
 
-STOP_FLAG = "STOP_REQUESTED"
-
-
 def run(episodes=12, max_steps=1500):
     knn = build_log_knn()
     log_db_povs, log_db_labels = load_log_db()
@@ -110,7 +93,7 @@ def run(episodes=12, max_steps=1500):
     env.seed(2147483637)
 
     for ep in range(episodes):
-        if os.path.exists(STOP_FLAG):
+        if STOP_FLAG.exists():
             print("[RUN] Stop flag detected — exiting after current run.")
             break
         obs  = env.reset()

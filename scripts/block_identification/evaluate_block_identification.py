@@ -4,7 +4,7 @@ import gym
 import minerl
 from utils import flatten_pov
 from KNN_model import KNN
-from block_identification_train_no_empty import (
+from block_identification_train import (
     ENV_NAME,
     KNN_MODEL_PATH,
     random_wander_action,

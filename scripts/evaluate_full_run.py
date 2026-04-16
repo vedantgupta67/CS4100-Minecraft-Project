@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import warnings
+from pathlib import Path
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -42,20 +43,51 @@ from wood_crafting_agent import (
     N_ACTIONS,
     N_RECIPE_ACTIONS,
     PLANK_TYPES,
-    SLOTS,
-    WORLD_SEED,
     PPOAgent,
-    _patch_jvm_memory,
 )
+from shared_runtime import ACTION_REPEAT, SLOTS, WORLD_SEED, patch_jvm_memory
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_VPT_MODEL = SCRIPT_DIR / "foundation-model-1x.model"
+DEFAULT_VPT_WEIGHTS = SCRIPT_DIR / "foundation-model-1x.weights"
+
+
+def _resolve_path(path_value: str | None, default_path: Path, label: str) -> str:
+    """Resolve a file path robustly across common working directories."""
+    candidates = []
+    if path_value is None:
+        candidates = [default_path]
+    else:
+        raw = Path(path_value)
+        if raw.is_absolute():
+            candidates = [raw]
+        else:
+            candidates = [
+                Path.cwd() / raw,
+                SCRIPT_DIR / raw,
+                PROJECT_ROOT / raw,
+                SCRIPT_DIR / raw.name,
+            ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+
+    searched = "\n".join(f"  - {c}" for c in candidates)
+    raise FileNotFoundError(
+        f"Could not find {label}. Searched:\n{searched}\n"
+        f"Hint: pass --vpt-{label} with an explicit path."
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-POV_SIZE    = 64
-PITCH_MIN   = -60.0
-PITCH_MAX   =  60.0
-ACTION_REPEAT = 4   # matches training env
+POV_SIZE = 64
+PITCH_MIN = -60.0
+PITCH_MAX = 60.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -183,7 +215,7 @@ class EvalEnv:
     TABLE_REWARD = 10_000.0
 
     def __init__(self, wood_n_inv: int, craft_n_inv: int, render: bool = False):
-        _patch_jvm_memory("6G")
+        patch_jvm_memory("6G")
         print("[EvalEnv] Launching Minecraft Java process …")
         self._raw          = gym.make("MineRLObtainDiamondShovel-v0")
         self._render       = render
@@ -395,6 +427,8 @@ def evaluate(
     render:          bool,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    vpt_model = _resolve_path(vpt_model, DEFAULT_VPT_MODEL, "model")
+    vpt_weights = _resolve_path(vpt_weights, DEFAULT_VPT_WEIGHTS, "weights")
     print(f"[eval] device={device}")
 
     # ── Load both policies (n_inventory inferred from each checkpoint) ────

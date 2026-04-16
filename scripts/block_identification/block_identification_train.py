@@ -1,18 +1,22 @@
-import os
+import argparse
 import json
 import time
-import joblib
-import numpy as np
+from pathlib import Path
+
 import gym
+import joblib
 import minerl
+import numpy as np
+
 from utils import flatten_pov
 
 
 # ── Config ─────────────────────────────────────────────────────────
-ENV_NAME          = "MineRLObtainDiamondShovel-v0"
-POV_DB_PATH       = "block_observations_2.npz"   # compressed POV arrays
-LABEL_DB_PATH     = "block_labels_2.json"        # matching block labels
-KNN_MODEL_PATH    = "knn_model.joblib"         # trained KNN model
+ENV_NAME = "MineRLObtainDiamondShovel-v0"
+BASE_DIR = Path(__file__).resolve().parent
+POV_DB_PATH = BASE_DIR / "block_observations_2.npz"   # compressed POV arrays
+LABEL_DB_PATH = BASE_DIR / "block_labels_2.json"      # matching block labels
+KNN_MODEL_PATH = BASE_DIR / "knn_model.joblib"        # trained KNN model
 MINE_TIMEOUT      = 10.0    # seconds before giving up on a mine attempt
 MIN_MINE_STEPS    = 100    # minimum attack steps before checking pov diff
 POV_DIFF_THRESH   = 0.01   # fraction of pixels that must change to count as "pov changed"
@@ -29,9 +33,9 @@ def load_db() -> tuple[np.ndarray | None, list[str]]:
     """Load existing POV arrays and labels. Returns (povs, labels)."""
     povs   = None
     labels = []
-    if os.path.exists(POV_DB_PATH) and os.path.exists(LABEL_DB_PATH):
+    if POV_DB_PATH.exists() and LABEL_DB_PATH.exists():
         povs   = np.load(POV_DB_PATH)["povs"]
-        with open(LABEL_DB_PATH) as f:
+        with LABEL_DB_PATH.open() as f:
             labels = json.load(f)
         print(f"[DB] Loaded {len(labels)} existing observations")
     return povs, labels
@@ -40,7 +44,7 @@ def load_db() -> tuple[np.ndarray | None, list[str]]:
 def save_db(povs: np.ndarray, labels: list[str]):
     """Overwrite both DB files atomically."""
     np.savez_compressed(POV_DB_PATH, povs=povs)
-    with open(LABEL_DB_PATH, "w") as f:
+    with LABEL_DB_PATH.open("w") as f:
         json.dump(labels, f)
 
 
@@ -61,15 +65,16 @@ def append_to_db(existing_povs: np.ndarray | None,
 
 # ── KNN helpers ────────────────────────────────────────────────────
 
-def load_knn_model(path: str = KNN_MODEL_PATH):
+def load_knn_model(path: str | Path = KNN_MODEL_PATH):
     """
     Load a trained sklearn KNN from disk.
     """
-    if not os.path.exists(path):
+    model_path = Path(path)
+    if not model_path.exists():
         print(f"[KNN] No model found at '{path}' — mining all blocks unconditionally")
         return None
-    model = joblib.load(path)
-    print(f"[KNN] Loaded KNN model from '{path}'")
+    model = joblib.load(model_path)
+    print(f"[KNN] Loaded KNN model from '{model_path}'")
     return model
 
 
@@ -162,9 +167,10 @@ class BlockDataCollector:
     MINE   = "mine"
     PICKUP = "pickup"
 
-    def __init__(self, env, knn_model=None):
+    def __init__(self, env, knn_model=None, include_empty_labels: bool = True):
         self.env              = env
         self.knn_model        = knn_model
+        self.include_empty_labels = include_empty_labels
         self.povs, self.labels = load_db()
         self._state           = self.WANDER
         self._wander_ctr      = 0
@@ -283,8 +289,12 @@ class BlockDataCollector:
 
     def _label_and_save(self, delta: dict, pov: np.ndarray):
         if not delta:
-            label = "far_away"
-            print("[LABEL] No inventory change — saved as 'far_away'")
+            if self.include_empty_labels:
+                label = "far_away"
+                print("[LABEL] No inventory change — saved as 'far_away'")
+            else:
+                print("[LABEL] No inventory change — no data saved")
+                return
         else:
             label = max(delta, key=delta.get)
             print(f"[LABEL] Block identified as '{label}' (delta: {delta})")
@@ -297,11 +307,15 @@ class BlockDataCollector:
 
 # ── Run ────────────────────────────────────────────────────────────
 
-def run(episodes=1, max_steps=50000):
+def run(episodes: int = 1, max_steps: int = 50000, include_empty_labels: bool = True):
     env       = gym.make(ENV_NAME)
     env.seed(2147483637)
     knn_model = load_knn_model()
-    collector = BlockDataCollector(env, knn_model=knn_model)
+    collector = BlockDataCollector(
+        env,
+        knn_model=knn_model,
+        include_empty_labels=include_empty_labels,
+    )
 
     for ep in range(episodes):
         obs  = collector.reset()
@@ -322,4 +336,19 @@ def run(episodes=1, max_steps=50000):
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(
+        description="Collect labelled MineRL block observations for KNN training.",
+    )
+    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=50000)
+    parser.add_argument(
+        "--skip-empty",
+        action="store_true",
+        help="Do not save 'far_away' samples when inventory does not change.",
+    )
+    args = parser.parse_args()
+    run(
+        episodes=args.episodes,
+        max_steps=args.max_steps,
+        include_empty_labels=not args.skip_empty,
+    )

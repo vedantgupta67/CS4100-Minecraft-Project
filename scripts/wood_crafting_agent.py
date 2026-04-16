@@ -51,6 +51,7 @@ import threading
 import time
 import warnings
 from collections import deque
+from pathlib import Path
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -62,10 +63,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from shared_runtime import SLOTS, WORLD_SEED, patch_jvm_memory
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_VPT_MODEL = SCRIPT_DIR / "foundation-model-1x.model"
+DEFAULT_VPT_WEIGHTS = SCRIPT_DIR / "foundation-model-1x.weights"
+
+
+def _resolve_path(path_value: str | None, default_path: Path, label: str) -> str:
+    """Resolve a file path robustly across common working directories."""
+    candidates = []
+    if path_value is None:
+        candidates = [default_path]
+    else:
+        raw = Path(path_value)
+        if raw.is_absolute():
+            candidates = [raw]
+        else:
+            candidates = [
+                Path.cwd() / raw,
+                SCRIPT_DIR / raw,
+                PROJECT_ROOT / raw,
+                SCRIPT_DIR / raw.name,
+            ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+
+    searched = "\n".join(f"  - {c}" for c in candidates)
+    raise FileNotFoundError(
+        f"Could not find {label}. Searched:\n{searched}\n"
+        f"Hint: pass --vpt-{label} with an explicit path."
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1.  Environment
@@ -235,6 +271,16 @@ class AutoCraftWrapper(gym.Wrapper):
         inv = obs.get("inventory", {})
         return int(inv.get("dirt", 0))
 
+    @staticmethod
+    def _count_planks(obs) -> int:
+        inv = obs.get("inventory", {})
+        return sum(int(inv.get(t, 0)) for t in PLANK_TYPES)
+
+    @staticmethod
+    def _count_table(obs) -> int:
+        inv = obs.get("inventory", {})
+        return int(inv.get("crafting_table", 0))
+
     def _attach(self, obs):
         obs["_logs"]     = self._total_logs
         obs["_planks"]   = self._count_planks(obs)
@@ -380,9 +426,6 @@ class ActionRepeatWrapper(gym.Wrapper):
         return obs, total_reward, done, info
 
 
-WORLD_SEED = 175901257196164
-
-
 class FixedSeedWrapper(gym.Wrapper):
     """Re-seeds the environment with a fixed value before every reset so the
     same world is generated each episode."""
@@ -395,18 +438,6 @@ class FixedSeedWrapper(gym.Wrapper):
 # ──────────────────────────────────────────────────────────────────────────────
 # Crafting-specific wrappers
 # ──────────────────────────────────────────────────────────────────────────────
-
-# GUI slot positions as camera-degree offsets from screen centre.
-# Values are (pitch_delta, yaw_delta) — the exact values to send as the
-# camera action from the centre position (where Minecraft places the cursor
-# when the inventory opens).  No pixel-conversion factor needed.
-SLOTS = {
-    "recipe_book_btn": (-2, 4),   # (pitch, yaw) — green book icon
-    "recipe_planks":   (-6, -20),   # (pitch, yaw) — planks recipe entry
-    "recipe_table":    (-6, -12),   # (pitch, yaw) — crafting table entry
-    "output_slot":     (-6, 23),   # (pitch, yaw) — output slot
-    "inv_slot":        (0, 0),   # (pitch, yaw) — first inventory slot
-}
 
 N_RECIPE_ACTIONS = 6
 
@@ -567,22 +598,8 @@ class MaxStepsWrapper(gym.Wrapper):
 
 
 def _patch_jvm_memory(max_mem: str = "6G"):
-    """
-    Monkey-patch MinecraftInstance to use a larger JVM heap before gym.make().
-    The default is 4G which leaks and freezes after thousands of steps.
-    This avoids modifying any minerl source files.
-    """
-    try:
-        import minerl.env.malmo as _malmo
-        _orig = _malmo.MinecraftInstance.__init__
-        def _patched(self, port=None, existing=False, status_dir=None,
-                     seed=None, instance_id=None, max_mem=None):
-            _orig(self, port=port, existing=existing, status_dir=status_dir,
-                  seed=seed, instance_id=instance_id, max_mem=max_mem or "6G")
-        _malmo.MinecraftInstance.__init__ = _patched
-        print(f"[make_env] JVM heap set to {max_mem}")
-    except Exception as e:
-        print(f"[make_env] Warning: could not patch JVM memory: {e}")
+    """Backwards-compatible alias for shared JVM memory patch helper."""
+    patch_jvm_memory(max_mem)
 
 
 def make_env():
@@ -983,11 +1000,14 @@ def train(
     print(f"        Obs pov shape  : {env.observation_space['pov'].shape}")
     print(f"        Obs inv shape  : {env.observation_space['inventory'].shape}")
 
+    resolved_vpt_model = _resolve_path(vpt_model, DEFAULT_VPT_MODEL, "model")
+    resolved_vpt_weights = _resolve_path(vpt_weights, DEFAULT_VPT_WEIGHTS, "weights")
+
     agent = PPOAgent(
         n_actions=_n_actions,
         n_inventory=len(OBS_ITEMS),
-        vpt_model=vpt_model,
-        vpt_weights=vpt_weights,
+        vpt_model=resolved_vpt_model,
+        vpt_weights=resolved_vpt_weights,
         device=device,
     )
 
@@ -1182,16 +1202,22 @@ def train(
 def evaluate(
     checkpoint: str,
     n_episodes: int = 5,
-    vpt_model:  str = "Video-Pre-Training/foundation-model-1x.model",
-    vpt_weights:str = "Video-Pre-Training/foundation-model-1x.weights",
+    vpt_model:  str | None = None,
+    vpt_weights: str | None = None,
+    env_mode: str = "survival",
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    resolved_vpt_model = _resolve_path(vpt_model, DEFAULT_VPT_MODEL, "model")
+    resolved_vpt_weights = _resolve_path(vpt_weights, DEFAULT_VPT_WEIGHTS, "weights")
+    _env_factory = make_crafting_env if env_mode == "crafting" else make_env
+    _n_actions = N_RECIPE_ACTIONS if env_mode == "crafting" else N_ACTIONS
+
     agent = PPOAgent(
-        n_actions=N_ACTIONS,
+        n_actions=_n_actions,
         n_inventory=len(OBS_ITEMS),
-        vpt_model=vpt_model,
-        vpt_weights=vpt_weights,
+        vpt_model=resolved_vpt_model,
+        vpt_weights=resolved_vpt_weights,
         device=device,
     )
     agent.load(checkpoint)
@@ -1206,7 +1232,7 @@ def evaluate(
 
     ep = 0
     while ep < n_episodes:
-        env = make_env()
+        env = _env_factory()
         try:
             obs       = _reset_with_timeout(env)
             total_rew = 0.0
@@ -1298,12 +1324,10 @@ if __name__ == "__main__":
     parser.add_argument("--save-every",   type=int, default=50_000)
     parser.add_argument("--episodes",     type=int, default=5,
                         help="Number of eval episodes (--eval only)")
-    parser.add_argument("--vpt-model",   type=str,
-                        default="./scripts/foundation-model-1x.model",
-                        help="Path to VPT .model file")
-    parser.add_argument("--vpt-weights", type=str,
-                        default="./scripts/foundation-model-1x.weights",
-                        help="Path to VPT .weights file")
+    parser.add_argument("--vpt-model",   type=str, default=None,
+                        help="Path to VPT .model file (default: scripts/foundation-model-1x.model)")
+    parser.add_argument("--vpt-weights", type=str, default=None,
+                        help="Path to VPT .weights file (default: scripts/foundation-model-1x.weights)")
     parser.add_argument("--print-rewards", action="store_true",
                         help="Print reward at every step during training")
     parser.add_argument("--tensorboard-dir", type=str, default="tb_logs",
